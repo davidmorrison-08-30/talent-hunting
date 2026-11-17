@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any
 
 import boto3
@@ -45,7 +46,17 @@ class BedrockLLM:
         if self.settings.aws_default_profile:
             kwargs["profile_name"] = self.settings.aws_default_profile
         if self.settings.aws_bearer_token_bedrock:
-            kwargs["aws_session_token"] = self.settings.aws_bearer_token_bedrock
+            # botocore reads a Bedrock API key from AWS_BEARER_TOKEN_BEDROCK and
+            # then prefers "bearer" signature version over SigV4. Passing the key
+            # as aws_session_token would instead break the credential chain.
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = (
+                self.settings.aws_bearer_token_bedrock
+            )
+            # An empty AWS_DEFAULT_PROFILE makes botocore try to resolve a
+            # profile named "" and fail, so it is cleared when unset.
+            if not self.settings.aws_default_profile:
+                os.environ.pop("AWS_DEFAULT_PROFILE", None)
+                os.environ.pop("AWS_PROFILE", None)
 
         try:
             self._client = boto3.client("bedrock-runtime", **kwargs)
