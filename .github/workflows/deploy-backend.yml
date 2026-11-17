@@ -1,0 +1,107 @@
+name: Deploy backend to ECS
+
+# Pushes the backend image to ECR and updates the ECS service.
+#
+# The AWS region, the deploy role and the resource names are fixed values,
+# not GitHub secrets. Only the application configuration comes from secrets.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE_TO_ASSUME: github-deploy
+  ECR_REPOSITORY: talent-hunting
+  ECS_CLUSTER: talent-hunting-cluster
+  ECS_SERVICE: talent-hunting-backend-svc
+  ECS_TASK_FAMILY: talent-hunting-backend
+
+jobs:
+  deploy:
+    name: Build and deploy the backend
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::752919052098:role/github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker tag "$ECR_REPOSITORY:$IMAGE_TAG" \
+            "${{ steps.ecr-login.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "${{ steps.ecr-login.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Render the ECS task definition
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" \
+            --query taskDefinition > task-definition.json
+          jq --arg image "${{ steps.ecr-login.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG" \
+            '.containerDefinitions[0].image = $image' task-definition.json > task-definition-new.json
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition-new.json > task-definition-clean.json
+          aws ecs register-task-definition \
+            --cli-input-json file://task-definition-clean.json > /dev/null
+
+      - name: Update the ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment > /dev/null
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --timeout 600
+
+      - name: Verify the service is healthy
+        run: |
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].{running:runningCount,desired:desiredCount,deployments:length(deployments)}'
+
+  test:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run ruff check app tests
+
+      - name: Mypy
+        run: uv run mypy app
+
+      - name: Pytest
+        run: uv run pytest -q
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/talent_hunting
