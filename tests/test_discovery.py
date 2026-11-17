@@ -72,6 +72,11 @@ def _profile(
     return profile
 
 
+def _profiles(count: int = 1) -> list[dict[str, Any]]:
+    """Build ``count`` distinct profiles for the search endpoints."""
+    return [_profile(user_id=str(i), username=f"user_{i}") for i in range(count)]
+
+
 def _posts(count: int = 12) -> list[dict[str, Any]]:
     texts = [
         "Shipped a new IK solver today",
@@ -828,3 +833,169 @@ async def test_discovery_skips_tweet_search_when_the_probe_refused_it(
     # User-search candidates still come through, and the limitation is reported.
     assert [account["username"] for account in result.accounts] == ["alice_robotics"]
     assert any("unavailable" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_small_candidate_budget_does_not_over_read(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """A small ``max_candidates`` must not pull whole pages of results.
+
+    The X search endpoints always return up to ``max_results`` items, so a
+    request larger than the remaining budget reads far more than the caller
+    asked for and burns the X API budget.
+    """
+    user_search = respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": _profiles(50), "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(200, json={"data": _posts(100), "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    p
+                    for p in _profiles(50)
+                    if p["id"] in request.url.params.get("ids", "").split(",")
+                ]
+            },
+        )
+    )
+    timeline = respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(100)})
+    )
+
+    from app.x.capabilities import capability_probe
+
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": ["robotics engineer"],
+                "post_queries": ['"robotics" -is:retweet'],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": ["Engineer"],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+            "Handle: @alice_robotics": {
+                "is_bot": False,
+                "confidence": 0.95,
+                "reasons": [],
+                "signals_present": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+
+    capability_probe.invalidate()
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            target_segment=["robotics engineer"],
+            limits=SearchLimits(
+                max_accounts=1,
+                max_candidates=1,
+                max_posts_per_account=0,
+            ),
+        )
+
+    # The page size must respect the remaining candidate budget.
+    assert int(user_search.calls[0].request.url.params["max_results"]) <= 1
+    # No post was requested for evidence, so no timeline read happens at all.
+    assert timeline.call_count == 0
+    # Only the budgeted candidates are considered.
+    assert result.candidates_seen <= 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_zero_posts_per_account_skips_the_timeline_read(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """``max_posts_per_account=0`` must not read a single post."""
+    from app.x.capabilities import capability_probe
+
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": _profiles(1), "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": _profiles(1)})
+    )
+    timeline = respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(20)})
+    )
+
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": ["robotics engineer"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+            "Handle: @alice_robotics": {
+                "is_bot": False,
+                "confidence": 0.95,
+                "reasons": [],
+                "signals_present": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+
+    capability_probe.invalidate()
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            target_segment=["robotics engineer"],
+            limits=SearchLimits(
+                max_accounts=1,
+                max_candidates=5,
+                max_posts_per_account=0,
+            ),
+        )
+
+    assert timeline.call_count == 0
+    assert result.estimated_cost_usd < 0.1

@@ -39,6 +39,23 @@ MAX_PAGES_PER_QUERY = 2
 DEFAULT_MAX_CANDIDATES = 150
 #: Maximum accounts returned in one run.
 DEFAULT_MAX_ACCOUNTS = 40
+#: Largest page requested from ``/2/users/search`` in one call.
+USER_SEARCH_PAGE_MAX = 100
+#: Largest page requested from the tweet-search endpoints in one call.
+POST_SEARCH_PAGE_MAX = 100
+
+
+def _page_size(remaining: int, page_max: int) -> int:
+    """Return the page size that still fits in the remaining candidate budget.
+
+    The X search endpoints always return up to ``max_results`` items, so a
+    request larger than the remaining budget reads far more than the caller
+    asked for. The floor is the smallest value X accepts for the endpoint,
+    which the client raises internally when needed.
+    """
+    if remaining <= 0:
+        return 0
+    return min(remaining, page_max)
 
 
 @dataclass
@@ -339,11 +356,18 @@ async def _search_candidates(
 
     # -- user search ------------------------------------------------------
     for query in query_plan.user_queries:
+        # The page size is capped by the remaining candidate budget so a small
+        # ``max_candidates`` does not still pull a full page of 100 accounts.
+        page_size = _page_size(
+            limits.max_candidates - len(candidate_ids), USER_SEARCH_PAGE_MAX
+        )
+        if page_size <= 0:
+            break
         next_token: str | None = None
         for _ in range(MAX_PAGES_PER_QUERY):
             try:
                 data = await client.search_users(
-                    query, max_results=100, next_token=next_token
+                    query, max_results=page_size, next_token=next_token
                 )
             except XApiError as exc:
                 log.warning("user_search_failed", query=query, **exc.log_fields())
@@ -359,17 +383,26 @@ async def _search_candidates(
             next_token = (data.get("meta") or {}).get("next_token")
             if not next_token or len(candidate_ids) >= limits.max_candidates:
                 break
+        if len(candidate_ids) >= limits.max_candidates:
+            break
 
     # -- tweet search -----------------------------------------------------
     # Skipped entirely when the capability probe found no usable endpoint.
     if search_posts_enabled:
         for query in query_plan.post_queries:
+            # Tweet search pages cost a full ``max_results`` of reads, so the
+            # page size is bounded by the remaining candidate budget.
+            page_size = _page_size(
+                limits.max_candidates - len(candidate_ids), POST_SEARCH_PAGE_MAX
+            )
+            if page_size <= 0:
+                break
             next_token = None
             for _ in range(MAX_PAGES_PER_QUERY):
                 try:
                     data = await client.search_posts(
                         query,
-                        max_results=100,
+                        max_results=page_size,
                         next_token=next_token,
                         full_archive=full_archive,
                     )
@@ -388,6 +421,8 @@ async def _search_candidates(
                 next_token = (data.get("meta") or {}).get("next_token")
                 if not next_token or len(candidate_ids) >= limits.max_candidates:
                     break
+            if len(candidate_ids) >= limits.max_candidates:
+                break
     else:
         log.info("post_search_skipped_capability_unavailable")
 
@@ -411,22 +446,27 @@ async def _search_candidates(
             )
 
     # -- fetch evidence ----------------------------------------------------
-    for candidate in candidates:
-        try:
-            tweets = await client.get_user_tweets(
-                candidate.x_user_id,
-                max_results=limits.max_posts_per_account,
-            )
-            candidate.posts = list(tweets.get("data") or [])
-            candidate.posts_read = len(candidate.posts)
-            posts_read += candidate.posts_read
-        except XApiError as exc:
-            log.warning(
-                "candidate_posts_failed",
-                x_user_id=candidate.x_user_id,
-                **exc.log_fields(),
-            )
-            failures.append(f"Reading posts for {candidate.x_user_id} failed: {exc}")
+    # ``max_posts_per_account=0`` means "read no posts": the call is skipped
+    # entirely so no read cost is incurred at all.
+    if limits.max_posts_per_account > 0:
+        for candidate in candidates:
+            try:
+                tweets = await client.get_user_tweets(
+                    candidate.x_user_id,
+                    max_results=limits.max_posts_per_account,
+                )
+                candidate.posts = list(tweets.get("data") or [])
+                candidate.posts_read = len(candidate.posts)
+                posts_read += candidate.posts_read
+            except XApiError as exc:
+                log.warning(
+                    "candidate_posts_failed",
+                    x_user_id=candidate.x_user_id,
+                    **exc.log_fields(),
+                )
+                failures.append(
+                    f"Reading posts for {candidate.x_user_id} failed: {exc}"
+                )
 
     api_calls = dict(client.call_counts)
     return candidates, posts_read, users_read, api_calls, failures
