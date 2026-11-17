@@ -108,13 +108,17 @@ jobs:
               ])
               if fetched.returncode == 0:
                   try:
-                      existing = json.loads(fetched.stdout)
-                  except json.JSONDecodeError:
+                      # The CLI returns the whole API response; the stored
+                      # document is the SecretString inside it.
+                      response = json.loads(fetched.stdout)
+                      stored = response.get("SecretString", response)
+                      existing = json.loads(stored)
+                  except (json.JSONDecodeError, AttributeError, TypeError):
                       existing = {}
               # A repository secret that resolves to an empty string must not
               # wipe the value that is already stored.
               for key, value in existing.items():
-                  if not payload.get(key):
+                  if key in payload and not payload.get(key):
                       payload[key] = value
 
           # The values are never printed: they go straight into the secret.
