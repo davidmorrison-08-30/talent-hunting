@@ -19,7 +19,7 @@ from app.api.outreach import router as outreach_router
 from app.config import get_settings
 from app.db import dispose_engine
 from app.errors import AppError
-from app.migrations import run_migrations
+from app.migrations import run_migrations, wait_for_database
 
 settings = get_settings()
 
@@ -43,6 +43,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.run_migrations_on_startup:
         log.info("migrations_start")
         try:
+            # The API and Postgres containers start together on ECS, so the
+            # database may not be listening yet.
+            await wait_for_database()
             await run_migrations()
         except Exception as exc:  # noqa: BLE001
             # A failed migration must stop the service from serving traffic
