@@ -45,26 +45,30 @@ jobs:
           # The repository secrets hold the backend configuration. They are
           # write-only in GitHub, so they can only be read from inside the
           # workflow: that is why the sync happens here and not locally.
-          DEBUG: ${{ secrets.DEBUG }}
-          LOG_LEVEL: ${{ secrets.LOG_LEVEL }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          DB_ECHO: ${{ secrets.DB_ECHO }}
-          X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
-          X_CLIENT_SECRET: ${{ secrets.X_CLIENT_SECRET }}
-          X_REDIRECT_URI: ${{ secrets.X_REDIRECT_URI }}
-          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
-          X_SCOPES: ${{ secrets.X_SCOPES }}
-          AWS_BEDROCK_MODEL_ID: ${{ secrets.AWS_BEDROCK_MODEL_ID }}
-          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
-          AWS_DEFAULT_PROFILE: ${{ secrets.AWS_DEFAULT_PROFILE }}
-          DM_DAILY_CAP: ${{ secrets.DM_DAILY_CAP }}
-          DM_MIN_DELAY_SECONDS: ${{ secrets.DM_MIN_DELAY_SECONDS }}
-          DM_MAX_DELAY_SECONDS: ${{ secrets.DM_MAX_DELAY_SECONDS }}
-          DM_SIMILARITY_THRESHOLD: ${{ secrets.DM_SIMILARITY_THRESHOLD }}
-          DM_POLL_INTERVAL_SECONDS: ${{ secrets.DM_POLL_INTERVAL_SECONDS }}
-          DISCOVERY_SPEND_CEILING_USD: ${{ secrets.DISCOVERY_SPEND_CEILING_USD }}
-          RUN_MIGRATIONS_ON_STARTUP: ${{ secrets.RUN_MIGRATIONS_ON_STARTUP }}
-          ENABLE_DISPATCHER: ${{ secrets.ENABLE_DISPATCHER }}
+          #
+          # Every value is prefixed with TR_SECRET_ so that a secret named
+          # like an AWS CLI variable (AWS_DEFAULT_PROFILE) cannot shadow it
+          # and break the CLI's own configuration.
+          TR_SECRET_DEBUG: ${{ secrets.DEBUG }}
+          TR_SECRET_LOG_LEVEL: ${{ secrets.LOG_LEVEL }}
+          TR_SECRET_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TR_SECRET_DB_ECHO: ${{ secrets.DB_ECHO }}
+          TR_SECRET_X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
+          TR_SECRET_X_CLIENT_SECRET: ${{ secrets.X_CLIENT_SECRET }}
+          TR_SECRET_X_REDIRECT_URI: ${{ secrets.X_REDIRECT_URI }}
+          TR_SECRET_X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          TR_SECRET_X_SCOPES: ${{ secrets.X_SCOPES }}
+          TR_SECRET_AWS_BEDROCK_MODEL_ID: ${{ secrets.AWS_BEDROCK_MODEL_ID }}
+          TR_SECRET_AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          TR_SECRET_AWS_DEFAULT_PROFILE: ${{ secrets.AWS_DEFAULT_PROFILE }}
+          TR_SECRET_DM_DAILY_CAP: ${{ secrets.DM_DAILY_CAP }}
+          TR_SECRET_DM_MIN_DELAY_SECONDS: ${{ secrets.DM_MIN_DELAY_SECONDS }}
+          TR_SECRET_DM_MAX_DELAY_SECONDS: ${{ secrets.DM_MAX_DELAY_SECONDS }}
+          TR_SECRET_DM_SIMILARITY_THRESHOLD: ${{ secrets.DM_SIMILARITY_THRESHOLD }}
+          TR_SECRET_DM_POLL_INTERVAL_SECONDS: ${{ secrets.DM_POLL_INTERVAL_SECONDS }}
+          TR_SECRET_DISCOVERY_SPEND_CEILING_USD: ${{ secrets.DISCOVERY_SPEND_CEILING_USD }}
+          TR_SECRET_RUN_MIGRATIONS_ON_STARTUP: ${{ secrets.RUN_MIGRATIONS_ON_STARTUP }}
+          TR_SECRET_ENABLE_DISPATCHER: ${{ secrets.ENABLE_DISPATCHER }}
         run: |
           python3 - <<'PY'
           import json, os, subprocess, sys
@@ -80,7 +84,9 @@ jobs:
               "DISCOVERY_SPEND_CEILING_USD",
               "RUN_MIGRATIONS_ON_STARTUP", "ENABLE_DISPATCHER",
           ]
-          payload = {key: os.environ.get(key, "") for key in keys}
+          payload = {
+              key: os.environ.get(f"TR_SECRET_{key}", "") for key in keys
+          }
           # The values are never printed: they go straight into the secret.
           document = json.dumps(payload)
 
