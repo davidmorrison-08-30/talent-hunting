@@ -23,7 +23,7 @@ from urllib.parse import urlencode
 
 import httpx
 import structlog
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
@@ -114,6 +114,48 @@ async def _post_token_request(
     return response.json()
 
 
+async def fetch_authenticated_profile(
+    access_token: str, settings: Settings | None = None
+) -> dict[str, str]:
+    """Return the id and username of the account the token belongs to.
+
+    X's token response carries no user identity, so the id has to be read
+    from ``/2/users/me``. The access token is used directly instead of the
+    session: the token row does not exist yet at this point.
+    """
+    settings = settings or get_settings()
+    url = f"{settings.x_api_base_url.rstrip('/')}/2/users/me"
+    params = {"user.fields": "id,username"}
+
+    async with httpx.AsyncClient(timeout=settings.x_timeout_seconds) as client:
+        response = await client.get(
+            url,
+            params=params,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+
+    if response.status_code >= 400:
+        log.error(
+            "oauth_profile_request_failed",
+            status=response.status_code,
+            body=response.text[:400],
+        )
+        raise UpstreamError(
+            "Could not read the authenticated X account; re-authorization is required",
+            details={"status_code": response.status_code, "body": response.text[:400]},
+        )
+
+    data = response.json().get("data") or {}
+    user_id = str(data.get("id") or "").strip()
+    if not user_id:
+        raise UpstreamError(
+            "X did not return an account id for the authenticated user",
+            details={"response_keys": sorted(data.keys())},
+        )
+
+    return {"id": user_id, "username": str(data.get("username") or "")}
+
+
 async def exchange_code_for_token(
     session: AsyncSession,
     *,
@@ -137,8 +179,18 @@ async def exchange_code_for_token(
         },
     )
 
+    # The token response has no identity, so the account is read from the
+    # API before anything is stored. A token without a known id would be
+    # unusable for DMs, which are addressed by user id.
+    profile = await fetch_authenticated_profile(data["access_token"], settings)
+
+    # Only one X account is connected at a time, and x_user_id is the primary
+    # key, so any previous row (including a legacy "unknown" one) is removed.
+    await session.execute(delete(OAuthToken))
+
     token = OAuthToken(
-        x_user_id=str(data.get("user_id") or data.get("x_user_id") or "unknown"),
+        x_user_id=profile["id"],
+        x_username=profile["username"] or None,
         access_token=data["access_token"],
         refresh_token=data.get("refresh_token"),
         scopes=data.get("scope", settings.x_scopes),
@@ -149,6 +201,7 @@ async def exchange_code_for_token(
     log.info(
         "oauth_token_stored",
         x_user_id=token.x_user_id,
+        x_username=token.x_username,
         has_refresh=bool(token.refresh_token),
     )
     return token

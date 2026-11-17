@@ -311,9 +311,14 @@ async def test_oauth_disconnect_clears_the_token(client: AsyncClient, db_session
     )
     await db_session.flush()
 
-    response = await client.get("/auth/x/disconnect", follow_redirects=False)
-    assert response.status_code == 307
-    assert response.headers["location"] == "/docs"
+    response = await client.get("/auth/x/disconnect")
+    assert response.status_code == 200
+    # The frontend parses the response as JSON, so it must not be a redirect
+    # to the HTML docs page.
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {"detail": "Disconnected"}
+
+    assert await db_session.get(OAuthToken, "self") is None
 
 
 # ---------------------------------------------------------------------------

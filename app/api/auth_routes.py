@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 
 from fastapi import APIRouter, Depends, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
@@ -89,6 +89,7 @@ async def status(
     return {
         "connected": True,
         "x_user_id": token.x_user_id,
+        "x_username": token.x_username,
         "scopes": token.scopes.split(),
         "expires_at": token.expires_at.isoformat() if token.expires_at else None,
         "fresh": token_is_fresh(token),
@@ -99,11 +100,11 @@ async def status(
 @router.get("/disconnect", summary="Remove the stored X token", response_model=None)
 async def disconnect(
     session: AsyncSession = Depends(get_session),
-) -> RedirectResponse:
+) -> JSONResponse:
     """Delete the stored token so a different account can be connected."""
     from sqlalchemy import delete
 
     from app.models import OAuthToken
 
     await session.execute(delete(OAuthToken))
-    return RedirectResponse(url="/docs", status_code=307)
+    return JSONResponse(status_code=200, content={"detail": "Disconnected"})

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 import respx
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -165,6 +166,137 @@ async def test_token_is_refreshed_when_it_expired(db_session: AsyncSession) -> N
     assert token.refresh_token == "refresh-2"
     assert token.expires_at is not None
     assert token.expires_at > datetime.now(UTC)
+
+
+@pytest.mark.asyncio
+async def test_fetch_authenticated_profile_returns_the_id_and_username() -> None:
+    """The account identity is read from /2/users/me, not the token response."""
+    with respx.mock:
+        route = respx.get("https://api.x.com/2/users/me").mock(
+            return_value=httpx.Response(
+                200, json={"data": {"id": "12345", "username": "operator"}}
+            )
+        )
+
+        profile = await x_auth.fetch_authenticated_profile("access-token")
+
+    assert profile == {"id": "12345", "username": "operator"}
+    # The token is presented as a bearer credential.
+    assert route.calls[0].request.headers["Authorization"] == "Bearer access-token"
+
+
+@pytest.mark.asyncio
+async def test_fetch_authenticated_profile_raises_when_the_call_fails() -> None:
+    with respx.mock:
+        respx.get("https://api.x.com/2/users/me").mock(
+            return_value=httpx.Response(401, json={"errors": [{"message": "bad"}]})
+        )
+
+        with pytest.raises(UpstreamError):
+            await x_auth.fetch_authenticated_profile("access-token")
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_stores_the_real_user_id(db_session: AsyncSession) -> None:
+    """The stored row carries the account id, not the placeholder "unknown"."""
+    with respx.mock:
+        respx.post("https://api.x.com/2/oauth2/token").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "at",
+                    "refresh_token": "rt",
+                    "expires_in": 7200,
+                    "scope": "tweet.read dm.read dm.write offline.access",
+                },
+            )
+        )
+        respx.get("https://api.x.com/2/users/me").mock(
+            return_value=httpx.Response(
+                200, json={"data": {"id": "999", "username": "operator"}}
+            )
+        )
+
+        token = await x_auth.exchange_code_for_token(
+            db_session, code="code-1", code_verifier="verifier-1"
+        )
+
+    assert token.x_user_id == "999"
+    assert token.x_username == "operator"
+    assert token.access_token == "at"
+    assert token.refresh_token == "rt"
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_replaces_a_previous_token(db_session: AsyncSession) -> None:
+    """Only one account is connected at a time, so the old row is removed."""
+    db_session.add(
+        OAuthToken(
+            x_user_id="unknown",
+            access_token="legacy",
+            refresh_token="legacy-refresh",
+            scopes="tweet.read",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    await db_session.flush()
+
+    with respx.mock:
+        respx.post("https://api.x.com/2/oauth2/token").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "at",
+                    "refresh_token": "rt",
+                    "expires_in": 7200,
+                    "scope": "tweet.read",
+                },
+            )
+        )
+        respx.get("https://api.x.com/2/users/me").mock(
+            return_value=httpx.Response(
+                200, json={"data": {"id": "999", "username": "operator"}}
+            )
+        )
+
+        token = await x_auth.exchange_code_for_token(
+            db_session, code="code-1", code_verifier="verifier-1"
+        )
+
+    assert token.x_user_id == "999"
+    # The legacy row is gone rather than lingering alongside the new one.
+    assert await db_session.get(OAuthToken, "unknown") is None
+    assert await db_session.get(OAuthToken, "999") is not None
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_stores_nothing_when_the_profile_fails(
+    db_session: AsyncSession,
+) -> None:
+    """A token whose account is unknown must not be persisted."""
+    with respx.mock:
+        respx.post("https://api.x.com/2/oauth2/token").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "at",
+                    "refresh_token": "rt",
+                    "expires_in": 7200,
+                    "scope": "tweet.read",
+                },
+            )
+        )
+        respx.get("https://api.x.com/2/users/me").mock(
+            return_value=httpx.Response(403, json={"errors": [{"message": "no"}]})
+        )
+
+        with pytest.raises(UpstreamError):
+            await x_auth.exchange_code_for_token(
+                db_session, code="code-1", code_verifier="verifier-1"
+            )
+
+    result = await db_session.execute(select(OAuthToken))
+    assert result.scalars().all() == []
 
 
 @pytest.mark.asyncio
