@@ -418,6 +418,58 @@ async def test_discovery_search_returns_accounts(
     assert body["stats"]["returned"] == 1
     assert body["accounts"][0]["username"] == "alice"
     assert body["target_segment"] == ["robotics"]
+    assert body["accounts"][0]["origin"] == "search"
+
+
+@pytest.mark.asyncio
+async def test_discovery_search_reports_the_seed_accounts(
+    client: AsyncClient, db_session, auth_token, monkeypatch
+) -> None:
+    """The response reports how the seed accounts were treated."""
+    from app.agents import search as search_agent
+
+    async def _fake_run(session, client_, **kwargs):  # type: ignore[no-untyped-def]
+        run = DiscoveryRun(
+            id=uuid.uuid4(),
+            input_type="seed_accounts",
+            target_segment=[],
+            seed_accounts=["https://x.com/alice"],
+            status="completed",
+            stats={},
+        )
+        session.add(run)
+        await session.flush()
+        return search_agent.DiscoveryResult(
+            run_id=run.id,
+            target_segment=search_agent.TargetSegment(keywords=[]),
+            query_plan=search_agent.QueryPlan(),
+            accounts=[
+                {
+                    "x_user_id": "u1",
+                    "username": "alice",
+                    "profile_url": "https://x.com/alice",
+                    "origin": "seed",
+                }
+            ],
+            candidates_seen=0,
+            seeds_included=1,
+            seeds_resolved=1,
+            seeds_unresolved=0,
+            seeds_dropped=0,
+        )
+
+    monkeypatch.setattr("app.api.discovery.run_discovery", _fake_run)
+
+    response = await client.post(
+        "/api/v1/discovery/search", json={"seed_accounts": ["https://x.com/alice"]}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accounts"][0]["origin"] == "seed"
+    assert body["stats"]["seeds_supplied"] == 1
+    assert body["stats"]["seeds_resolved"] == 1
+    assert body["stats"]["seeds_included"] == 1
+    assert body["stats"]["seeds_dropped"] == 0
 
 
 @pytest.mark.asyncio

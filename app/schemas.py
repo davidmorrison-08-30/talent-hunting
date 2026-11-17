@@ -97,6 +97,13 @@ class DiscoveredAccount(ApiModel):
     created_at: str | None = None
     bot: BotAssessment = Field(default_factory=BotAssessment)
     key_information: KeyInformation = Field(default_factory=KeyInformation)
+    origin: str = Field(
+        default="search",
+        description=(
+            '"seed" when the account was supplied by the caller as a seed, '
+            '"search" when the X search found it.'
+        ),
+    )
 
 
 class QueryUsed(ApiModel):
@@ -110,6 +117,10 @@ class DiscoveryStats(ApiModel):
     returned: int = 0
     api_calls: dict[str, int] = Field(default_factory=dict)
     estimated_cost_usd: float = 0.0
+    seeds_supplied: int = 0
+    seeds_resolved: int = 0
+    seeds_included: int = 0
+    seeds_dropped: int = 0
 
 
 class DiscoveryResponse(ApiModel):

@@ -616,6 +616,396 @@ async def test_run_discovery_with_seed_accounts(
     # No caller-supplied segment, so the segment is purely LLM-derived.
     assert result.target_segment.source == "llm"
     assert result.accounts
+    # The seed account the caller named must be in the results.
+    assert any(account["x_user_id"] == "seed1" for account in result.accounts)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_discovery_includes_the_seed_account(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """A named seed account is always returned, even when the search finds none.
+
+    The seed is the account the caller explicitly asked about, so dropping it
+    because the search happened to return nothing would lose the one account
+    the request was about.
+    """
+    seed = _profile("seed42", "carol_ai")
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
+        return_value=httpx.Response(200, json={"data": [seed]})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(6)})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(403, json={"errors": [{"message": "not enabled"}]})
+    )
+    # The search returns nothing: only the seed can be returned.
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    llm = FakeLLM(
+        [
+            {
+                "keywords": ["ai researcher"],
+                "exclude_keywords": [],
+                "rationale": "seeds are researchers",
+            },
+            {
+                "user_queries": ["ai researcher"],
+                "post_queries": ['"ai researcher" -is:retweet'],
+                "rationale": "r",
+            },
+            {"is_bot": False, "confidence": 0.9, "reasons": [], "signals_present": []},
+            {
+                "bio": "AI researcher",
+                "occupation": "Researcher",
+                "titles": [],
+                "specializations": ["ML"],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        ]
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.segment.get_llm", lambda: llm)
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            seed_accounts=["https://x.com/carol_ai"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+
+    assert [account["x_user_id"] for account in result.accounts] == ["seed42"]
+    assert result.accounts[0]["origin"] == "seed"
+    assert result.seeds_included == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_discovery_returns_seeds_when_no_segment_can_be_derived(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """Without a usable segment the run still answers with the seed accounts."""
+    seed = _profile("seed7", "dave_robotics")
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
+        return_value=httpx.Response(200, json={"data": [seed]})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(4)})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(403, json={"errors": [{"message": "not enabled"}]})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    # The segment derivation returns no usable keywords.
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": [],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.segment.get_llm", lambda: llm)
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            seed_accounts=["https://x.com/dave_robotics"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+
+    assert [account["x_user_id"] for account in result.accounts] == ["seed7"]
+    assert any("seed" in warning.lower() for warning in result.warnings)
+    # The search stage must not run without a segment.
+    assert result.candidates_seen == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_seed_accounts_are_truncated_to_max_accounts(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """max_accounts is the hard cap on the accounts returned.
+
+    The seeds are truncated to the number of slots the searched accounts
+    leave free, so the response never grows beyond the requested bound.
+    """
+    seeds = {
+        "alice_seed": _profile("seed_a", "alice_seed"),
+        "bob_seed": _profile("seed_b", "bob_seed"),
+        "carol_seed": _profile("seed_c", "carol_seed"),
+    }
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    seeds[request.url.params.get("usernames", "")]
+                ]
+            },
+        )
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(403, json={"errors": [{"message": "not enabled"}]})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": ["robotics"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.segment.get_llm", lambda: llm)
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            seed_accounts=[
+                "https://x.com/alice_seed",
+                "https://x.com/bob_seed",
+                "https://x.com/carol_seed",
+            ],
+            limits=SearchLimits(max_accounts=2, max_candidates=5),
+        )
+
+    # Three seeds, but only two may be returned.
+    assert len(result.accounts) == 2
+    assert len(result.accounts) <= 2
+    assert {account["x_user_id"] for account in result.accounts} == {
+        "seed_a",
+        "seed_b",
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_seeds_fill_only_the_slots_the_search_left_free(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """The seeds are truncated to the slots the searched accounts leave free.
+
+    Two accounts are found by the search and three seeds are supplied, so only
+    one seed fits within the max_accounts limit of three.
+    """
+    seed = _profile("seed_a", "alice_seed")
+    found = [_profile("found1", "frank_found"), _profile("found2", "grace_found")]
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
+        return_value=httpx.Response(200, json={"data": [seed]})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(403, json={"errors": [{"message": "not enabled"}]})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": found, "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": found})
+    )
+
+    llm = FakeLLM(
+        by_prompt={
+            "Analyze these seed accounts": {
+                "keywords": ["robotics engineer"],
+                "exclude_keywords": [],
+                "rationale": "the seed is a robotics engineer",
+            },
+            "Build a search plan": {
+                "user_queries": ["robotics"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.segment.get_llm", lambda: llm)
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            seed_accounts=["https://x.com/alice_seed"],
+            limits=SearchLimits(max_accounts=3, max_candidates=5),
+        )
+
+    # Two found by the search plus one seed fills the limit of three.
+    assert len(result.accounts) == 3
+    origins = {account["x_user_id"]: account["origin"] for account in result.accounts}
+    assert origins["found1"] == "search"
+    assert origins["found2"] == "search"
+    assert origins["seed_a"] == "seed"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_suppressed_seed_account_is_not_returned(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """A seed goes through the same suppression check as a searched account."""
+    from app.models import SuppressionEntry
+
+    seed = _profile("seed9", "eve_robotics")
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
+        return_value=httpx.Response(200, json={"data": [seed]})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(403, json={"errors": [{"message": "not enabled"}]})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    db_session.add(SuppressionEntry(x_user_id="seed9", handle="eve_robotics"))
+    await db_session.flush()
+
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": ["robotics"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.segment.get_llm", lambda: llm)
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            seed_accounts=["https://x.com/eve_robotics"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+
+    assert result.accounts == []
 
 
 @pytest.mark.asyncio

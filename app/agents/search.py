@@ -80,6 +80,9 @@ class Candidate:
     posts_read: int = 0
     users_read: int = 1
     source_queries: list[str] = field(default_factory=list)
+    #: "seed" when the account was supplied by the caller, "search" when the
+    #: X search found it. A seed that the search also returns keeps "search".
+    origin: str = "search"
 
 
 @dataclass
@@ -96,6 +99,44 @@ class DiscoveryResult:
     estimated_cost_usd: float = 0.0
     capabilities: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    #: How many of the supplied seed accounts made it into the results.
+    seeds_included: int = 0
+    #: How many supplied seed accounts resolved to a real X account.
+    seeds_resolved: int = 0
+    #: How many supplied seed accounts could not be resolved on X.
+    seeds_unresolved: int = 0
+    #: How many resolved seeds did not fit within max_accounts.
+    seeds_dropped: int = 0
+
+
+def _seed_to_candidate(profile: SeedProfile) -> Candidate | None:
+    """Turn a resolved seed profile into a candidate.
+
+    The seed's posts were already read while the segment was derived, so they
+    are reused here instead of being fetched again. This keeps the seed
+    inclusion free of extra X API cost.
+    """
+    if not profile.resolved or not profile.x_user_id:
+        return None
+
+    metrics = {
+        "followers_count": profile.followers_count,
+        "following_count": profile.following_count,
+    }
+    return Candidate(
+        x_user_id=profile.x_user_id,
+        profile={
+            "id": profile.x_user_id,
+            "username": profile.username,
+            "name": profile.display_name,
+            "description": profile.bio,
+            "public_metrics": metrics,
+        },
+        posts=list(profile.posts),
+        posts_read=len(profile.posts),
+        users_read=1,
+        origin="seed",
+    )
 
 
 def _estimate_cost(limits: SearchLimits, posts_read: int, users_read: int) -> float:
@@ -152,19 +193,48 @@ async def run_discovery(
             source="provided",
         )
 
+    # The seed accounts are candidates in their own right: the caller named
+    # them explicitly, so they belong in the results even when no segment
+    # could be derived from them.
+    seed_candidates = [
+        candidate
+        for candidate in (
+            _seed_to_candidate(profile) for profile in seed_profiles
+        )
+        if candidate is not None
+    ]
+
     if not segment.keywords:
-        run.status = "FAILED"
-        run.stats = {"error": "Could not derive a target segment."}
-        await session.flush()
-        return DiscoveryResult(
-            run_id=run.id,
-            target_segment=segment,
-            query_plan=QueryPlan(),
-            warnings=warnings + ["No usable target segment could be derived."],
+        if not seed_candidates:
+            run.status = "FAILED"
+            run.stats = {"error": "Could not derive a target segment."}
+            await session.flush()
+            return DiscoveryResult(
+                run_id=run.id,
+                target_segment=segment,
+                query_plan=QueryPlan(),
+                warnings=warnings + ["No usable target segment could be derived."],
+            )
+
+        # Seeds alone are enough to answer the request: there is no segment
+        # to search with, so the search stage is skipped entirely.
+        warnings.append(
+            "No usable target segment could be derived; returning the seed "
+            "accounts only."
+        )
+        segment = TargetSegment(
+            keywords=[],
+            exclude_keywords=list(segment.exclude_keywords),
+            rationale=segment.rationale,
+            source=segment.source,
         )
 
     # ---- Stage 2: query plan -------------------------------------------
-    query_plan = await build_query_plan(segment.keywords, segment.exclude_keywords)
+    query_plan = (
+        await build_query_plan(segment.keywords, segment.exclude_keywords)
+        if segment.keywords
+        else QueryPlan(rationale="No segment was derived; the search stage was skipped.")
+    )
 
     # ---- Capabilities ---------------------------------------------------
     try:
@@ -184,16 +254,25 @@ async def run_discovery(
     if mode_note:
         warnings.append(mode_note)
 
-    candidates, posts_read, users_read, api_calls, search_failures = (
-        await _search_candidates(
-            client,
-            query_plan,
-            limits,
-            full_archive=search_mode == "full_archive",
-            search_posts_enabled=search_mode != "none",
+    if segment.keywords:
+        candidates, posts_read, users_read, api_calls, search_failures = (
+            await _search_candidates(
+                client,
+                query_plan,
+                limits,
+                full_archive=search_mode == "full_archive",
+                search_posts_enabled=search_mode != "none",
+            )
         )
-    )
-    warnings.extend(search_failures)
+        warnings.extend(search_failures)
+    else:
+        # Without a segment there is nothing to search for, so no X request
+        # is made. The seed accounts are the whole answer.
+        candidates = []
+        posts_read = 0
+        users_read = 0
+        api_calls = dict(client.call_counts)
+        search_failures = []
 
     cost = _estimate_cost(limits, posts_read, users_read)
     if cost > limits.spend_ceiling_usd:
@@ -208,7 +287,34 @@ async def run_discovery(
     bots_filtered = 0
     suppressed_ids = await _suppressed_user_ids(session)
 
-    for candidate in candidates:
+    # The seed accounts are always offered to the filters, but only within
+    # the slots the searched accounts leave free: ``max_accounts`` is the
+    # hard cap on the number of accounts returned.
+    seed_slots = max(0, limits.max_accounts - len(candidates))
+    included_seeds: list[Candidate] = []
+    duplicate_seeds = 0
+    for candidate in seed_candidates:
+        if len(included_seeds) >= seed_slots:
+            break
+        if any(candidate.x_user_id == c.x_user_id for c in candidates):
+            # The search already found this account; it is not a seed slot.
+            duplicate_seeds += 1
+            continue
+        included_seeds.append(candidate)
+
+    # A seed is dropped when it did not fit within max_accounts. A seed that
+    # the search also found is not a drop: it is in the results already.
+    dropped_seeds = len(seed_candidates) - len(included_seeds) - duplicate_seeds
+    if dropped_seeds > 0:
+        warnings.append(
+            f"{dropped_seeds} seed account(s) did not fit within the "
+            f"max_accounts limit of {limits.max_accounts}."
+        )
+
+    # The searched accounts come first, then the seeds.
+    ordered_candidates = [*candidates, *included_seeds]
+
+    for candidate in ordered_candidates:
         # A suppressed account must never appear in discovery results.
         if candidate.x_user_id in suppressed_ids:
             continue
@@ -263,6 +369,7 @@ async def run_discovery(
                 "created_at": candidate.profile.get("created_at"),
                 "bot": assessment.to_payload(),
                 "key_information": key_info.to_payload(),
+                "origin": candidate.origin,
             }
         )
 
@@ -280,6 +387,10 @@ async def run_discovery(
         "users_read": users_read,
         "estimated_cost_usd": round(cost, 4),
         "warnings": warnings,
+        "seeds_supplied": len(seed_accounts or []),
+        "seeds_resolved": len(seed_candidates),
+        "seeds_included": len(included_seeds),
+        "seeds_dropped": dropped_seeds,
     }
     await session.flush()
 
@@ -294,6 +405,10 @@ async def run_discovery(
         estimated_cost_usd=cost,
         capabilities=caps.to_payload(),
         warnings=warnings,
+        seeds_included=len(included_seeds),
+        seeds_resolved=len(seed_candidates),
+        seeds_unresolved=len(seed_accounts or []) - len(seed_candidates),
+        seeds_dropped=dropped_seeds,
     )
 
 
@@ -518,6 +633,10 @@ async def _persist_account(
     account.bot_reasons = assessment.reasons
     account.key_info = key_info.to_payload()
     account.segment_tags = list(segment_tags)
+    # A seed account is tagged so the caller can tell it apart from an
+    # account the X search found.
+    if candidate.origin == "seed" and "seed" not in account.segment_tags:
+        account.segment_tags.append("seed")
     account.source_run_id = run_id
     account.last_seen_at = datetime.now(UTC)
 
