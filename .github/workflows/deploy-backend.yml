@@ -60,13 +60,16 @@ jobs:
           jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
             task-definition-new.json > task-definition-clean.json
           aws ecs register-task-definition \
-            --cli-input-json file://task-definition-clean.json > /dev/null
+            --cli-input-json file://task-definition-clean.json \
+            --query taskDefinition.taskDefinitionArn --output text > task-definition-arn.txt
+          echo "registered $(cat task-definition-arn.txt)"
 
       - name: Update the ECS service
         run: |
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
+            --task-definition "$(cat task-definition-arn.txt)" \
             --force-new-deployment > /dev/null
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER" \
@@ -82,6 +85,22 @@ jobs:
   test:
     name: Quality gates
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: talent_hunting
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d talent_hunting"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
