@@ -67,7 +67,7 @@ jobs:
           ENABLE_DISPATCHER: ${{ secrets.ENABLE_DISPATCHER }}
         run: |
           python3 - <<'PY'
-          import json, os, subprocess
+          import json, os, subprocess, sys
 
           keys = [
               "DEBUG", "LOG_LEVEL", "DATABASE_URL", "DB_ECHO",
@@ -84,28 +84,50 @@ jobs:
           # The values are never printed: they go straight into the secret.
           document = json.dumps(payload)
 
+          region = os.environ["AWS_REGION"]
           secret_id = "talent-hunting/backend-config"
-          described = subprocess.run(
-              ["aws", "secretsmanager", "describe-secret",
-               "--secret-id", secret_id, "--region", os.environ["AWS_REGION"]],
-              capture_output=True, text=True,
-          )
+
+          def run(args):
+              return subprocess.run(args, capture_output=True, text=True)
+
+          # The secret may or may not exist yet, and its name carries a random
+          # suffix, so the id is resolved rather than assumed.
+          described = run([
+              "aws", "secretsmanager", "describe-secret",
+              "--secret-id", secret_id, "--region", region,
+          ])
           if described.returncode == 0:
-              subprocess.run(
-                  ["aws", "secretsmanager", "put-secret-value",
-                   "--secret-id", secret_id, "--secret-string", document,
-                   "--region", os.environ["AWS_REGION"]],
-                  check=True, capture_output=True,
-              )
-              print(f"updated {secret_id}")
+              action = "updated"
+              updated = run([
+                  "aws", "secretsmanager", "put-secret-value",
+                  "--secret-id", secret_id, "--secret-string", document,
+                  "--region", region,
+              ])
           else:
-              subprocess.run(
-                  ["aws", "secretsmanager", "create-secret",
-                   "--name", secret_id, "--secret-string", document,
-                   "--region", os.environ["AWS_REGION"]],
-                  check=True, capture_output=True,
-              )
-              print(f"created {secret_id}")
+              action = "created"
+              updated = run([
+                  "aws", "secretsmanager", "create-secret",
+                  "--name", secret_id, "--secret-string", document,
+                  "--region", region,
+              ])
+              if updated.returncode != 0 and "ResourceExistsException" in updated.stderr:
+                  # It exists after all: fall back to updating it.
+                  action = "updated"
+                  updated = run([
+                      "aws", "secretsmanager", "put-secret-value",
+                      "--secret-id", secret_id, "--secret-string", document,
+                      "--region", region,
+                  ])
+
+          if updated.returncode != 0:
+              sys.stderr.write(described.stderr)
+              sys.stderr.write(updated.stderr)
+              sys.exit(updated.returncode)
+
+          empty = sorted(k for k, v in payload.items() if not v)
+          print(f"{action} {secret_id}")
+          if empty:
+              print("WARNING: empty repository secrets: " + ", ".join(empty))
           PY
 
       - name: Build and push the image
