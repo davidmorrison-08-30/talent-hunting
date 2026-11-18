@@ -575,20 +575,22 @@ async def test_run_discovery_with_seed_accounts(
         return_value=httpx.Response(200, json={"data": [seed]})
     )
 
+    # The responses are keyed by prompt so the test does not depend on the
+    # order in which the agents call the model: the seed is now assessed
+    # before the segment is derived.
     llm = FakeLLM(
-        [
-            {
+        by_prompt={
+            "Analyze these seed accounts": {
                 "keywords": ["ai researcher", "machine learning"],
                 "exclude_keywords": ["crypto"],
                 "rationale": "seeds are researchers",
             },
-            {
+            "Build a search plan": {
                 "user_queries": ["ai researcher"],
                 "post_queries": ['"machine learning" -is:retweet'],
                 "rationale": "r",
             },
-            {"is_bot": False, "confidence": 0.9, "reasons": [], "signals_present": []},
-            {
+            "Extract key information about this person": {
                 "bio": "AI researcher",
                 "occupation": "Researcher",
                 "titles": [],
@@ -598,7 +600,13 @@ async def test_run_discovery_with_seed_accounts(
                 "future_plans": [],
                 "evidence": [],
             },
-        ]
+            "Handle: @carol_ai": {
+                "is_bot": False,
+                "confidence": 0.9,
+                "reasons": [],
+                "signals_present": [],
+            },
+        }
     )
     monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
     monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
@@ -777,8 +785,9 @@ async def test_seed_accounts_are_truncated_to_max_accounts(
 ) -> None:
     """max_accounts is the hard cap on the accounts returned.
 
-    The seeds are truncated to the number of slots the searched accounts
-    leave free, so the response never grows beyond the requested bound.
+    The seeds come first, so they are truncated to the number of slots the
+    searched accounts leave free, and the response never grows beyond the
+    requested bound.
     """
     seeds = {
         "alice_seed": _profile("seed_a", "alice_seed"),
@@ -851,13 +860,16 @@ async def test_seed_accounts_are_truncated_to_max_accounts(
             limits=SearchLimits(max_accounts=2, max_candidates=5),
         )
 
-    # Three seeds, but only two may be returned.
+    # Three seeds, but only two may be returned. The seeds come first, so the
+    # first two in the order the caller supplied them are kept.
     assert len(result.accounts) == 2
     assert len(result.accounts) <= 2
-    assert {account["x_user_id"] for account in result.accounts} == {
+    assert [account["x_user_id"] for account in result.accounts] == [
         "seed_a",
         "seed_b",
-    }
+    ]
+    assert result.seeds_included == 2
+    assert result.seeds_dropped == 1
 
 
 @pytest.mark.asyncio
@@ -865,10 +877,11 @@ async def test_seed_accounts_are_truncated_to_max_accounts(
 async def test_seeds_fill_only_the_slots_the_search_left_free(
     db_session, auth_token, monkeypatch
 ) -> None:
-    """The seeds are truncated to the slots the searched accounts leave free.
+    """The seeds come first and the search only fills the remaining slots.
 
-    Two accounts are found by the search and three seeds are supplied, so only
-    one seed fits within the max_accounts limit of three.
+    One seed is supplied and the search finds two more accounts, but the
+    max_accounts limit of three is shared: the seed takes the first slot and
+    the search may only contribute the remaining two.
     """
     seed = _profile("seed_a", "alice_seed")
     found = [_profile("found1", "frank_found"), _profile("found2", "grace_found")]
@@ -932,12 +945,108 @@ async def test_seeds_fill_only_the_slots_the_search_left_free(
             limits=SearchLimits(max_accounts=3, max_candidates=5),
         )
 
-    # Two found by the search plus one seed fills the limit of three.
+    # The seed plus the two searched accounts fill the limit of three.
     assert len(result.accounts) == 3
     origins = {account["x_user_id"]: account["origin"] for account in result.accounts}
+    assert origins["seed_a"] == "seed"
     assert origins["found1"] == "search"
     assert origins["found2"] == "search"
-    assert origins["seed_a"] == "seed"
+
+    # The seed is the first result: the caller named it explicitly.
+    assert result.accounts[0]["x_user_id"] == "seed_a"
+    assert result.accounts[0]["origin"] == "seed"
+    assert result.seeds_included == 1
+    assert result.seeds_dropped == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_no_search_is_made_when_the_seeds_fill_max_accounts(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """The X search is skipped entirely when the seeds fill the budget.
+
+    Two seeds and a max_accounts of two leave no room for a searched
+    account, so the search endpoints must not be called at all: the run
+    answers with the seeds alone.
+    """
+    seeds = {
+        "alice_seed": _profile("seed_a", "alice_seed"),
+        "bob_seed": _profile("seed_b", "bob_seed"),
+    }
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            json={"data": seeds[request.url.path.rsplit("/", 1)[-1]]},
+        )
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+    # These routes must stay untouched: the seeds fill every slot.
+    user_search = respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    recent_search = respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    all_search = respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    hydrate = respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    llm = FakeLLM(
+        by_prompt={
+            "Analyze these seed accounts": {
+                "keywords": ["robotics engineer"],
+                "exclude_keywords": [],
+                "rationale": "the seeds are robotics engineers",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.segment.get_llm", lambda: llm)
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            seed_accounts=["https://x.com/alice_seed", "https://x.com/bob_seed"],
+            limits=SearchLimits(max_accounts=2, max_candidates=5),
+        )
+
+    # Both seeds are returned, in the order the caller supplied them.
+    assert [account["x_user_id"] for account in result.accounts] == [
+        "seed_a",
+        "seed_b",
+    ]
+    assert result.seeds_included == 2
+    assert result.seeds_dropped == 0
+
+    # No candidate was searched for, so no search endpoint was called.
+    assert result.candidates_seen == 0
+    assert user_search.call_count == 0
+    assert recent_search.call_count == 0
+    assert all_search.call_count == 0
+    assert hydrate.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -1008,6 +1117,90 @@ async def test_a_suppressed_seed_account_is_not_returned(
         )
 
     assert result.accounts == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_filtered_seed_frees_its_slot_for_a_searched_account(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """A seed that is filtered out must not consume one of the slots.
+
+    The seed is on the suppression list, so it is never returned. Its slot
+    is left free for the search, which is why the searched account still
+    appears within the max_accounts limit.
+    """
+    from app.models import SuppressionEntry
+
+    seed = _profile("seed9", "eve_robotics")
+    found = _profile("found1", "frank_found")
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
+        return_value=httpx.Response(200, json={"data": seed})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(403, json={"errors": [{"message": "not enabled"}]})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [found], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": [found]})
+    )
+
+    db_session.add(SuppressionEntry(x_user_id="seed9", handle="eve_robotics"))
+    await db_session.flush()
+
+    llm = FakeLLM(
+        by_prompt={
+            "Analyze these seed accounts": {
+                "keywords": ["robotics engineer"],
+                "exclude_keywords": [],
+                "rationale": "the seed is a robotics engineer",
+            },
+            "Build a search plan": {
+                "user_queries": ["robotics"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.segment.get_llm", lambda: llm)
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            seed_accounts=["https://x.com/eve_robotics"],
+            limits=SearchLimits(max_accounts=1, max_candidates=5),
+        )
+
+    # The suppressed seed is not returned, and its slot went to the search.
+    assert [account["x_user_id"] for account in result.accounts] == ["found1"]
+    assert result.seeds_included == 0
+    assert result.candidates_seen == 1
 
 
 @pytest.mark.asyncio

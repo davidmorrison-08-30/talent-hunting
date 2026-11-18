@@ -338,9 +338,12 @@ with `status: "BLOCKED"` so a partial batch is never lost.
 
 1. **Seed analysis** — resolve each seed handle, pull its posts newest → oldest, and extract bio and
    post text.
-2. **Segment derivation** — the LLM turns that content into a target segment: keyword list plus
+2. **Seed screening** — the seed accounts are checked against the suppression list and the bot verdict
+   before anything else happens, because their verdict decides how many slots the search may still fill.
+   A seed that is filtered out frees its slot instead of consuming one.
+3. **Segment derivation** — the LLM turns that content into a target segment: keyword list plus
    optional `exclude_keywords`. If the caller also supplied `target_segment`, the two are merged.
-3. **Query formation** — the LLM emits two kinds of query:
+4. **Query formation** — the LLM emits two kinds of query:
    - plain-text queries for `GET /2/users/search` (sanitized to ≤50 characters, operator words such as
      `is`, `retweet` and `lang` stripped, because that endpoint matches plain text only);
    - operator-rich queries for `GET /2/tweets/search/recent` — or `/all` when the capability probe
@@ -348,18 +351,36 @@ with `status: "BLOCKED"` so a partial batch is never lost.
      (`min_faves:`, `min_retweets:`) are rewritten to their API spellings (`min_likes:`,
      `min_reposts:`), and a query with no positive clause is dropped, because X rejects both with
      HTTP 400.
-4. **Search and hydration** — candidates are collected from both searches, hydrated in batches of 100
+5. **Search and hydration** — candidates are collected from both searches, hydrated in batches of 100
    via `GET /2/users` (the by-IDs endpoint; `GET /2/users/by` is the by-usernames endpoint), and their
    recent posts fetched for evidence and bot signals.
-5. **Hybrid bot detection** — deterministic heuristics (see below) plus an LLM verdict, combined into
+6. **Hybrid bot detection** — deterministic heuristics (see below) plus an LLM verdict, combined into
    one score. `bot_score >= bot_score_threshold` excludes the account. Every account keeps its score
    and reasons for audit, and `include_bots=true` returns them instead of dropping them.
-6. **Key-information extraction** — the LLM produces `bio`, `occupation`, `titles`,
+7. **Key-information extraction** — the LLM produces `bio`, `occupation`, `titles`,
    `specializations`, `interests`, `milestones`, `future_plans` and `evidence[]`, grounded in the real
    fetched content only.
-7. **Persistence** — accounts are upserted into `discovered_accounts` with a `source_run_id`, and
+8. **Persistence** — accounts are upserted into `discovered_accounts` with a `source_run_id`, and
    `discovery_runs.stats` records candidates seen, bots filtered, API calls per endpoint and estimated
    cost.
+
+### The seed accounts come first
+
+The caller named the seed accounts explicitly, so they are the most relevant accounts a run can
+return, and they are always placed at the front of the results:
+
+- the seeds are returned in the order the caller supplied them;
+- the number of **other** accounts is `max_accounts` minus the number of seeds that survived the
+  filters;
+- a seed that is suppressed or flagged as a bot is not returned and does not use up a slot — the
+  search gets that slot instead;
+- when the seeds fill `max_accounts` on their own, **no X search is performed at all**: the query
+  plan, the capability probe and the search endpoints are all skipped, so the run costs nothing
+  beyond resolving the seeds themselves.
+
+The run statistics report this as `seeds_supplied`, `seeds_resolved`, `seeds_included` and
+`seeds_dropped`. A seed is only dropped when the caller supplied more seeds than `max_accounts`
+allows; the first ones in the caller's order are kept.
 
 ### Bot detection heuristics
 

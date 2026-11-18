@@ -200,11 +200,65 @@ async def run_discovery(
 
     warnings: list[str] = []
     seed_profiles: list[SeedProfile] = []
+    bots_filtered = 0
 
-    # ---- Stage 1: target segment ---------------------------------------
+    # ---- Stage 1: the seed accounts -----------------------------------
+    # The seed accounts are candidates in their own right: the caller named
+    # them explicitly, so they belong in the results even when no segment
+    # could be derived from them.
+    seed_profiles = await collect_seed_profiles(client, seed_accounts or [])
+    seed_candidates = [
+        candidate
+        for candidate in (
+            _seed_to_candidate(profile) for profile in seed_profiles
+        )
+        if candidate is not None
+    ]
+
+    # A suppressed account must never appear in discovery results, so the
+    # seeds are checked against the opt-out list before they are counted.
+    # A suppressed seed frees its slot for a searched account.
+    suppressed_ids = await _suppressed_user_ids(session)
+    seeds = [
+        candidate
+        for candidate in seed_candidates
+        if candidate.x_user_id not in suppressed_ids
+    ]
+
+    # ---- Stage 2: bot detection for the seeds --------------------------
+    # The seeds are assessed before the search, because their verdict decides
+    # how many slots the search may still fill: a seed that is filtered out
+    # must not consume one of the ``max_accounts`` slots.
+    seed_assessments: dict[str, BotAssessment] = {}
+    surviving_seeds: list[Candidate] = []
+    for candidate in seeds:
+        assessment = await assess_account(
+            candidate.profile,
+            candidate.posts,
+            threshold=bot_score_threshold,
+        )
+        seed_assessments[candidate.x_user_id] = assessment
+        if assessment.verdict == BotVerdict.LIKELY_BOT.value and not include_bots:
+            bots_filtered += 1
+            continue
+        surviving_seeds.append(candidate)
+
+    # The seeds come first, so they are truncated to ``max_accounts`` in the
+    # order the caller supplied them.
+    dropped_seeds = max(0, len(surviving_seeds) - limits.max_accounts)
+    if dropped_seeds > 0:
+        surviving_seeds = surviving_seeds[: limits.max_accounts]
+        warnings.append(
+            f"{dropped_seeds} seed account(s) did not fit within the "
+            f"max_accounts limit of {limits.max_accounts}."
+        )
+
+    # The remaining slots are what the X search may fill.
+    remaining = max(0, limits.max_accounts - len(surviving_seeds))
+
+    # ---- Stage 3: target segment ---------------------------------------
     segment: TargetSegment
     if seed_accounts:
-        seed_profiles = await collect_seed_profiles(client, seed_accounts)
         derived = await derive_target_segment(seed_profiles)
         segment = derived.merged_with(target_segment or [])
         for profile in seed_profiles:
@@ -217,17 +271,6 @@ async def run_discovery(
             rationale="Segment supplied directly by the caller.",
             source="provided",
         )
-
-    # The seed accounts are candidates in their own right: the caller named
-    # them explicitly, so they belong in the results even when no segment
-    # could be derived from them.
-    seed_candidates = [
-        candidate
-        for candidate in (
-            _seed_to_candidate(profile) for profile in seed_profiles
-        )
-        if candidate is not None
-    ]
 
     if not segment.keywords:
         if not seed_candidates:
@@ -254,50 +297,77 @@ async def run_discovery(
             source=segment.source,
         )
 
-    # ---- Stage 2: query plan -------------------------------------------
-    query_plan = (
-        await build_query_plan(segment.keywords, segment.exclude_keywords)
-        if segment.keywords
-        else QueryPlan(rationale="No segment was derived; the search stage was skipped.")
-    )
+    # ---- Stage 4: capabilities and the search --------------------------
+    caps = Capabilities()
+    query_plan = QueryPlan()
 
-    # ---- Capabilities ---------------------------------------------------
-    try:
-        caps: Capabilities = await capability_probe.probe(client)
-    except XApiError as exc:
-        caps = Capabilities()
-        log.warning("capability_probe_failed", **exc.log_fields())
-        detail = exc.log_fields().get("x_error")
-        suffix = f": {detail}" if detail else ""
-        warnings.append(f"Capability probe failed{suffix}: {exc}")
+    # The seed accounts already fill every slot, so no X request is made at
+    # all: the query plan, the capability probe and the search itself are
+    # all skipped.
+    candidates: list[Candidate] = []
+    posts_read = 0
+    users_read = 0
+    api_calls = dict(client.call_counts)
+    search_failures: list[str] = []
 
-    # ---- Stage 3: search -----------------------------------------------
-    # The capability probe decides *which* tweet-search endpoint may be used.
-    # When neither is available the post-search stage is skipped entirely
-    # rather than firing requests at an endpoint X has already refused.
-    search_mode, mode_note = _resolve_search_mode(caps)
-    if mode_note:
-        warnings.append(mode_note)
+    if remaining == 0:
+        log.info("discovery_search_skipped_seeds_fill_budget")
+        warnings.append(
+            "The seed accounts fill the max_accounts limit, so no X search "
+            "was performed."
+        )
+        query_plan = QueryPlan(
+            rationale="The seed accounts filled max_accounts; no search was needed."
+        )
+    else:
+        # ---- Stage 4a: query plan ----------------------------------------
+        query_plan = (
+            await build_query_plan(segment.keywords, segment.exclude_keywords)
+            if segment.keywords
+            else QueryPlan(
+                rationale="No segment was derived; the search stage was skipped."
+            )
+        )
 
-    if segment.keywords:
-        candidates, posts_read, users_read, api_calls, search_failures = (
-            await _search_candidates(
+        # ---- Stage 4b: capabilities -------------------------------------
+        try:
+            caps = await capability_probe.probe(client)
+        except XApiError as exc:
+            caps = Capabilities()
+            log.warning("capability_probe_failed", **exc.log_fields())
+            detail = exc.log_fields().get("x_error")
+            suffix = f": {detail}" if detail else ""
+            warnings.append(f"Capability probe failed{suffix}: {exc}")
+
+        # The capability probe decides *which* tweet-search endpoint may be
+        # used. When neither is available the post-search stage is skipped
+        # entirely rather than firing requests at an endpoint X has already
+        # refused.
+        search_mode, mode_note = _resolve_search_mode(caps)
+        if mode_note:
+            warnings.append(mode_note)
+
+        # ---- Stage 4c: the search ---------------------------------------
+        if segment.keywords:
+            (
+                candidates,
+                posts_read,
+                users_read,
+                api_calls,
+                search_failures,
+            ) = await _search_candidates(
                 client,
                 query_plan,
                 limits,
                 full_archive=search_mode == "full_archive",
                 search_posts_enabled=search_mode != "none",
+                max_results=remaining,
             )
-        )
-        warnings.extend(search_failures)
-    else:
-        # Without a segment there is nothing to search for, so no X request
-        # is made. The seed accounts are the whole answer.
-        candidates = []
-        posts_read = 0
-        users_read = 0
-        api_calls = dict(client.call_counts)
-        search_failures = []
+            warnings.extend(search_failures)
+        else:
+            # Without a segment there is nothing to search for, so no X
+            # request is made. The seed accounts are the whole answer.
+            api_calls = dict(client.call_counts)
 
     cost = _estimate_cost(limits, posts_read, users_read)
     if cost > limits.spend_ceiling_usd:
@@ -307,49 +377,36 @@ async def run_discovery(
         )
         candidates = candidates[: max(0, limits.max_candidates // 2)]
 
-    # ---- Stage 4-5: bot detection and key information ------------------
+    # ---- Stage 7: bot detection and key information --------------------
     results: list[dict[str, Any]] = []
-    bots_filtered = 0
-    suppressed_ids = await _suppressed_user_ids(session)
 
-    # The seed accounts are always offered to the filters, but only within
-    # the slots the searched accounts leave free: ``max_accounts`` is the
-    # hard cap on the number of accounts returned.
-    seed_slots = max(0, limits.max_accounts - len(candidates))
-    included_seeds: list[Candidate] = []
-    duplicate_seeds = 0
-    for candidate in seed_candidates:
-        if len(included_seeds) >= seed_slots:
-            break
-        if any(candidate.x_user_id == c.x_user_id for c in candidates):
-            # The search already found this account; it is not a seed slot.
-            duplicate_seeds += 1
-            continue
-        included_seeds.append(candidate)
-
-    # A seed is dropped when it did not fit within max_accounts. A seed that
-    # the search also found is not a drop: it is in the results already.
-    dropped_seeds = len(seed_candidates) - len(included_seeds) - duplicate_seeds
-    if dropped_seeds > 0:
-        warnings.append(
-            f"{dropped_seeds} seed account(s) did not fit within the "
-            f"max_accounts limit of {limits.max_accounts}."
-        )
-
-    # The searched accounts come first, then the seeds.
-    ordered_candidates = [*candidates, *included_seeds]
+    # The seeds come first: the caller named them explicitly, so they are
+    # the most relevant accounts the run can return. A seed the search also
+    # found is not repeated.
+    seed_ids = {candidate.x_user_id for candidate in surviving_seeds}
+    searched = [
+        candidate for candidate in candidates if candidate.x_user_id not in seed_ids
+    ]
+    ordered_candidates = [*surviving_seeds, *searched]
 
     for candidate in ordered_candidates:
         # A suppressed account must never appear in discovery results.
         if candidate.x_user_id in suppressed_ids:
             continue
 
-        assessment = await assess_account(
-            candidate.profile,
-            candidate.posts,
-            threshold=bot_score_threshold,
-        )
-        is_bot = assessment.verdict == BotVerdict.LIKELY_BOT.value
+        seed_assessment = seed_assessments.get(candidate.x_user_id)
+        account_assessment: BotAssessment
+        if seed_assessment is not None:
+            # The seed was already assessed before the search, so the verdict
+            # is reused instead of paying for the same LLM call twice.
+            account_assessment = seed_assessment
+        else:
+            account_assessment = await assess_account(
+                candidate.profile,
+                candidate.posts,
+                threshold=bot_score_threshold,
+            )
+        is_bot = account_assessment.verdict == BotVerdict.LIKELY_BOT.value
 
         if is_bot and not include_bots:
             bots_filtered += 1
@@ -357,7 +414,7 @@ async def run_discovery(
                 session,
                 run.id,
                 candidate,
-                assessment,
+                account_assessment,
                 KeyInformation(),
                 segment.keywords,
             )
@@ -369,7 +426,7 @@ async def run_discovery(
             session,
             run.id,
             candidate,
-            assessment,
+            account_assessment,
             key_info,
             segment.keywords,
         )
@@ -392,7 +449,7 @@ async def run_discovery(
                     )
                 ),
                 "created_at": candidate.profile.get("created_at"),
-                "bot": assessment.to_payload(),
+                "bot": account_assessment.to_payload(),
                 "key_information": key_info.to_payload(),
                 "origin": candidate.origin,
             }
@@ -414,7 +471,7 @@ async def run_discovery(
         "warnings": warnings,
         "seeds_supplied": len(seed_accounts or []),
         "seeds_resolved": len(seed_candidates),
-        "seeds_included": len(included_seeds),
+        "seeds_included": len(surviving_seeds),
         "seeds_dropped": dropped_seeds,
     }
     await session.flush()
@@ -430,7 +487,7 @@ async def run_discovery(
         estimated_cost_usd=cost,
         capabilities=caps.to_payload(),
         warnings=warnings,
-        seeds_included=len(included_seeds),
+        seeds_included=len(surviving_seeds),
         seeds_resolved=len(seed_candidates),
         seeds_unresolved=len(seed_accounts or []) - len(seed_candidates),
         seeds_dropped=dropped_seeds,
@@ -480,13 +537,22 @@ async def _search_candidates(
     *,
     full_archive: bool,
     search_posts_enabled: bool = True,
+    max_results: int | None = None,
 ) -> tuple[list[Candidate], int, int, dict[str, int], list[str]]:
     """Run the query plan and hydrate the candidates it returns.
 
     Returns the candidates, the post and user read counters, the per-endpoint
     API call counts and a list of human-readable failure messages so the caller
     can surface partial failures instead of silently returning fewer results.
+
+    ``max_results`` bounds how many candidates the search may contribute. The
+    seed accounts already occupy the first slots of ``max_accounts``, so the
+    search only has to look for the accounts that still fit. It never exceeds
+    ``max_candidates``.
     """
+    budget = limits.max_candidates if max_results is None else min(
+        max_results, limits.max_candidates
+    )
     candidate_ids: list[str] = []
     seen: set[str] = set()
     posts_read = 0
@@ -498,9 +564,7 @@ async def _search_candidates(
     for query in query_plan.user_queries:
         # The page size is capped by the remaining candidate budget so a small
         # ``max_candidates`` does not still pull a full page of 100 accounts.
-        page_size = _page_size(
-            limits.max_candidates - len(candidate_ids), USER_SEARCH_PAGE_MAX
-        )
+        page_size = _page_size(budget - len(candidate_ids), USER_SEARCH_PAGE_MAX)
         if page_size <= 0:
             break
         next_token: str | None = None
@@ -521,9 +585,9 @@ async def _search_candidates(
                     candidate_ids.append(uid)
 
             next_token = (data.get("meta") or {}).get("next_token")
-            if not next_token or len(candidate_ids) >= limits.max_candidates:
+            if not next_token or len(candidate_ids) >= budget:
                 break
-        if len(candidate_ids) >= limits.max_candidates:
+        if len(candidate_ids) >= budget:
             break
 
     # -- tweet search -----------------------------------------------------
@@ -532,9 +596,7 @@ async def _search_candidates(
         for query in query_plan.post_queries:
             # Tweet search pages cost a full ``max_results`` of reads, so the
             # page size is bounded by the remaining candidate budget.
-            page_size = _page_size(
-                limits.max_candidates - len(candidate_ids), POST_SEARCH_PAGE_MAX
-            )
+            page_size = _page_size(budget - len(candidate_ids), POST_SEARCH_PAGE_MAX)
             if page_size <= 0:
                 break
             next_token = None
@@ -559,14 +621,14 @@ async def _search_candidates(
                     posts_read += 1
 
                 next_token = (data.get("meta") or {}).get("next_token")
-                if not next_token or len(candidate_ids) >= limits.max_candidates:
+                if not next_token or len(candidate_ids) >= budget:
                     break
-            if len(candidate_ids) >= limits.max_candidates:
+            if len(candidate_ids) >= budget:
                 break
     else:
         log.info("post_search_skipped_capability_unavailable")
 
-    candidate_ids = candidate_ids[: limits.max_candidates]
+    candidate_ids = candidate_ids[:budget]
 
     # -- hydrate ----------------------------------------------------------
     candidates: list[Candidate] = []
