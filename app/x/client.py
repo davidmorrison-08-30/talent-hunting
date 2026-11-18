@@ -262,13 +262,18 @@ class XClient:
     # -- users -------------------------------------------------------------
     async def get_user_by_username(self, username: str) -> dict[str, Any] | None:
         """Look up a user by handle. Returns ``None`` when not found."""
+        # The single-user endpoint takes the username in its URL path. The
+        # ``usernames`` query parameter belongs to the bulk /2/users/by lookup
+        # and is invalid here (this route only accepts user.fields).
+        username = username.removeprefix("@").strip()
+        if not username:
+            return None
         try:
             data = await self.request(
                 "GET",
                 "/2/users/by/username/:username",
                 path_params={"username": username},
                 params={
-                    "usernames": username,
                     "user.fields": USER_FIELDS,
                     "expansions": USER_EXPANSIONS,
                     "tweet.fields": TWEET_FIELDS,
@@ -276,8 +281,8 @@ class XClient:
             )
         except NotFoundError:
             return None
-        users = data.get("data") or []
-        return users[0] if users else None
+        user = data.get("data")
+        return user if isinstance(user, dict) else None
 
     async def get_users_by_ids(self, user_ids: Iterable[str]) -> list[dict[str, Any]]:
         """Batch-lookup up to 100 users by id.
@@ -437,7 +442,7 @@ class XClient:
             json_body={"text": text},
         )
 
-    # -- introspection -----------------------------------------------------
+    # -- introspection ----------------------------------------------------
     def stats(self) -> dict[str, int]:
         """Call counts per endpoint for cost reporting."""
         return dict(self.call_counts)
