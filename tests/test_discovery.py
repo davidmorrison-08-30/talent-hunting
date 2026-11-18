@@ -556,7 +556,7 @@ async def test_run_discovery_with_seed_accounts(
         return_value=httpx.Response(200, json={"data": {"id": "self"}})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
-        return_value=httpx.Response(200, json={"data": [seed]})
+        return_value=httpx.Response(200, json={"data": seed})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
         return_value=httpx.Response(200, json={"data": _posts(6)})
@@ -570,6 +570,7 @@ async def test_run_discovery_with_seed_accounts(
     respx.get("https://api.x.com/2/users/search").mock(
         return_value=httpx.Response(200, json={"data": [seed], "meta": {}})
     )
+    # The bulk lookup answers with a list, unlike the single-user endpoint.
     respx.get("https://api.x.com/2/users").mock(
         return_value=httpx.Response(200, json={"data": [seed]})
     )
@@ -638,7 +639,7 @@ async def test_run_discovery_includes_the_seed_account(
         return_value=httpx.Response(200, json={"data": {"id": "self"}})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
-        return_value=httpx.Response(200, json={"data": [seed]})
+        return_value=httpx.Response(200, json={"data": seed})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
         return_value=httpx.Response(200, json={"data": _posts(6)})
@@ -712,7 +713,7 @@ async def test_run_discovery_returns_seeds_when_no_segment_can_be_derived(
         return_value=httpx.Response(200, json={"data": {"id": "self"}})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
-        return_value=httpx.Response(200, json={"data": [seed]})
+        return_value=httpx.Response(200, json={"data": seed})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
         return_value=httpx.Response(200, json={"data": _posts(4)})
@@ -792,9 +793,9 @@ async def test_seed_accounts_are_truncated_to_max_accounts(
         side_effect=lambda request: httpx.Response(
             200,
             json={
-                "data": [
-                    seeds[request.url.params.get("usernames", "")]
-                ]
+                # The single-user endpoint takes the handle in the path and
+                # answers with one object.
+                "data": seeds[request.url.path.rsplit("/", 1)[-1]]
             },
         )
     )
@@ -876,7 +877,7 @@ async def test_seeds_fill_only_the_slots_the_search_left_free(
         return_value=httpx.Response(200, json={"data": {"id": "self"}})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
-        return_value=httpx.Response(200, json={"data": [seed]})
+        return_value=httpx.Response(200, json={"data": seed})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
         return_value=httpx.Response(200, json={"data": _posts(3)})
@@ -953,7 +954,7 @@ async def test_a_suppressed_seed_account_is_not_returned(
         return_value=httpx.Response(200, json={"data": {"id": "self"}})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
-        return_value=httpx.Response(200, json={"data": [seed]})
+        return_value=httpx.Response(200, json={"data": seed})
     )
     respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
         return_value=httpx.Response(200, json={"data": _posts(3)})
