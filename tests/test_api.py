@@ -594,6 +594,52 @@ async def test_discovery_search_reports_the_seed_accounts(
 
 
 @pytest.mark.asyncio
+async def test_discovery_search_passes_the_known_human_accounts_through(
+    client: AsyncClient, db_session, auth_token, monkeypatch
+) -> None:
+    """The known-human list reaches the search agent."""
+    from app.agents import search as search_agent
+
+    received: dict[str, object] = {}
+
+    async def _fake_run(session, client_, **kwargs):  # type: ignore[no-untyped-def]
+        received.update(kwargs)
+        run = kwargs["run_id"]
+        record = await session.get(DiscoveryRun, run)
+        if record is not None:
+            record.status = "COMPLETED"
+            record.stats = {"candidates": 0, "bots_filtered": 0, "returned": 0}
+        await session.flush()
+        return search_agent.DiscoveryResult(
+            run_id=run,
+            target_segment=search_agent.TargetSegment(keywords=[]),
+            query_plan=search_agent.QueryPlan(),
+            accounts=[],
+            candidates_seen=0,
+        )
+
+    monkeypatch.setattr("app.services.search_runner.run_discovery", _fake_run)
+
+    response = await client.post(
+        "/api/v1/discovery/search",
+        json={
+            "seed_accounts": ["https://x.com/alice"],
+            "known_human_accounts": ["https://x.com/alice", "@bob"],
+        },
+    )
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        run_response = await client.get(f"/api/v1/discovery/runs/{run_id}")
+        if run_response.json()["status"] != "RUNNING":
+            break
+
+    assert received["known_human_accounts"] == ["https://x.com/alice", "@bob"]
+
+
+@pytest.mark.asyncio
 async def test_discovery_run_endpoints(client: AsyncClient, db_session) -> None:
     run = DiscoveryRun(
         id=uuid.uuid4(),

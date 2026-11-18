@@ -48,6 +48,7 @@ async def start_run(
     settings: Settings | None = None,
     include_bots: bool = False,
     bot_score_threshold: float = 0.6,
+    known_human_accounts: list[str] | None = None,
 ) -> uuid.UUID:
     """Create the run row and schedule the work.
 
@@ -76,6 +77,7 @@ async def start_run(
             settings=settings,
             include_bots=include_bots,
             bot_score_threshold=bot_score_threshold,
+            known_human_accounts=list(known_human_accounts or []),
         )
     )
     log.info("discovery_run_scheduled", run_id=str(run.id))
@@ -91,6 +93,7 @@ async def _execute(
     settings: Settings,
     include_bots: bool,
     bot_score_threshold: float,
+    known_human_accounts: list[str] | None = None,
 ) -> None:
     """Run the discovery in the background and record the outcome."""
     maker = get_sessionmaker()
@@ -107,6 +110,7 @@ async def _execute(
                     settings=settings,
                     include_bots=include_bots,
                     bot_score_threshold=bot_score_threshold,
+                    known_human_accounts=known_human_accounts or [],
                 )
             await session.commit()
             log.info(

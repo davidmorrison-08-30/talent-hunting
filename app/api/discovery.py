@@ -95,6 +95,7 @@ async def search_accounts(
         settings=settings,
         include_bots=request.include_bots,
         bot_score_threshold=request.bot_score_threshold,
+        known_human_accounts=request.known_human_accounts,
     )
 
     return DiscoveryAccepted(

@@ -24,6 +24,7 @@ from app.agents.segment import (
     TargetSegment,
     collect_seed_profiles,
     derive_target_segment,
+    parse_seed_handle,
 )
 from app.config import Settings, get_settings
 from app.models import BotVerdict, DiscoveredAccount, DiscoveryRun
@@ -57,6 +58,49 @@ def _page_size(remaining: int, page_max: int) -> int:
     if remaining <= 0:
         return 0
     return min(remaining, page_max)
+
+
+#: The reason recorded on an account the operator vouched for.
+KNOWN_HUMAN_REASON = (
+    "Marked as a known human by the operator; bot detection was skipped."
+)
+
+
+class KnownHumanMatcher:
+    """Matches accounts the operator vouched for as human.
+
+    The operator can name accounts they personally know are real people. Those
+    accounts skip bot detection entirely, because a bot heuristic that fires
+    on a genuine account would otherwise hide it from the results.
+
+    The names are matched on the handle, so ``https://x.com/someone``,
+    ``@someone`` and ``someone`` all refer to the same account. The match is
+    case-insensitive, because X handles are.
+    """
+
+    def __init__(self, entries: list[str] | None = None) -> None:
+        self._handles: set[str] = set()
+        for entry in entries or []:
+            handle = parse_seed_handle(entry)
+            if handle:
+                self._handles.add(handle.lower())
+
+    def __bool__(self) -> bool:
+        return bool(self._handles)
+
+    @property
+    def handles(self) -> set[str]:
+        """The lowercased handles the operator vouched for."""
+        return set(self._handles)
+
+    def matches(self, *, username: str | None, x_user_id: str | None = None) -> bool:
+        """Whether this account is one the operator vouched for."""
+        if not self._handles:
+            return False
+        if username and username.strip().lower() in self._handles:
+            return True
+        # A numeric id is matched when the operator pasted one directly.
+        return bool(x_user_id and x_user_id.strip() in self._handles)
 
 
 @dataclass
@@ -157,12 +201,16 @@ async def run_discovery(
     settings: Settings | None = None,
     include_bots: bool = False,
     bot_score_threshold: float = 0.6,
+    known_human_accounts: list[str] | None = None,
 ) -> DiscoveryResult:
     """Run the full discovery flow and persist the results.
 
     ``run_id`` reuses a run row that was created before the work started, so
     the caller can poll that run while the search is still going. Without it
     a new run is created here.
+
+    ``known_human_accounts`` names accounts the operator vouched for. A
+    matching account skips bot detection and is always treated as human.
     """
     settings = settings or get_settings()
     limits = limits or SearchLimits(
@@ -202,6 +250,15 @@ async def run_discovery(
     seed_profiles: list[SeedProfile] = []
     bots_filtered = 0
 
+    # The accounts the operator vouched for skip bot detection entirely.
+    known_humans = KnownHumanMatcher(known_human_accounts)
+    humans_bypassed = 0
+    if known_humans:
+        log.info(
+            "known_human_accounts_supplied",
+            count=len(known_humans.handles),
+        )
+
     # ---- Stage 1: the seed accounts -----------------------------------
     # The seed accounts are candidates in their own right: the caller named
     # them explicitly, so they belong in the results even when no segment
@@ -229,14 +286,33 @@ async def run_discovery(
     # The seeds are assessed before the search, because their verdict decides
     # how many slots the search may still fill: a seed that is filtered out
     # must not consume one of the ``max_accounts`` slots.
+    #
+    # A seed the operator vouched for is never assessed: it is known to be
+    # human, so the bot heuristics cannot override that.
     seed_assessments: dict[str, BotAssessment] = {}
     surviving_seeds: list[Candidate] = []
     for candidate in seeds:
-        assessment = await assess_account(
-            candidate.profile,
-            candidate.posts,
-            threshold=bot_score_threshold,
-        )
+        if known_humans.matches(
+            username=str(candidate.profile.get("username") or ""),
+            x_user_id=candidate.x_user_id,
+        ):
+            assessment = BotAssessment(
+                score=0.0,
+                verdict=BotVerdict.HUMAN.value,
+                reasons=[KNOWN_HUMAN_REASON],
+            )
+            humans_bypassed += 1
+            log.info(
+                "known_human_bypassed_bot_detection",
+                x_user_id=candidate.x_user_id,
+                origin=candidate.origin,
+            )
+        else:
+            assessment = await assess_account(
+                candidate.profile,
+                candidate.posts,
+                threshold=bot_score_threshold,
+            )
         seed_assessments[candidate.x_user_id] = assessment
         if assessment.verdict == BotVerdict.LIKELY_BOT.value and not include_bots:
             bots_filtered += 1
@@ -400,6 +476,22 @@ async def run_discovery(
             # The seed was already assessed before the search, so the verdict
             # is reused instead of paying for the same LLM call twice.
             account_assessment = seed_assessment
+        elif known_humans.matches(
+            username=str(candidate.profile.get("username") or ""),
+            x_user_id=candidate.x_user_id,
+        ):
+            # The operator vouched for this account, so it is not assessed.
+            account_assessment = BotAssessment(
+                score=0.0,
+                verdict=BotVerdict.HUMAN.value,
+                reasons=[KNOWN_HUMAN_REASON],
+            )
+            humans_bypassed += 1
+            log.info(
+                "known_human_bypassed_bot_detection",
+                x_user_id=candidate.x_user_id,
+                origin=candidate.origin,
+            )
         else:
             account_assessment = await assess_account(
                 candidate.profile,
@@ -473,6 +565,7 @@ async def run_discovery(
         "seeds_resolved": len(seed_candidates),
         "seeds_included": len(surviving_seeds),
         "seeds_dropped": dropped_seeds,
+        "humans_bypassed": humans_bypassed,
     }
     await session.flush()
 
@@ -724,6 +817,15 @@ async def _persist_account(
     # account the X search found.
     if candidate.origin == "seed" and "seed" not in account.segment_tags:
         account.segment_tags.append("seed")
+    # An account the operator vouched for is tagged too, so it is visible in
+    # the results that bot detection was skipped for it.
+    if (
+        assessment.verdict == BotVerdict.HUMAN.value
+        and assessment.reasons
+        and KNOWN_HUMAN_REASON in assessment.reasons
+        and "known_human" not in account.segment_tags
+    ):
+        account.segment_tags.append("known_human")
     account.source_run_id = run_id
     account.last_seen_at = datetime.now(UTC)
 

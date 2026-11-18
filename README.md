@@ -251,6 +251,7 @@ Request body:
 {
   "target_segment": ["robotics engineer", "embodied AI"],
   "seed_accounts": ["https://x.com/someone"],
+  "known_human_accounts": ["https://x.com/a-friend"],
   "max_accounts": 2,
   "max_candidates": 5,
   "max_posts_per_account": 11,
@@ -381,6 +382,23 @@ return, and they are always placed at the front of the results:
 The run statistics report this as `seeds_supplied`, `seeds_resolved`, `seeds_included` and
 `seeds_dropped`. A seed is only dropped when the caller supplied more seeds than `max_accounts`
 allows; the first ones in the caller's order are kept.
+
+### Known humans skip bot detection
+
+`known_human_accounts` names accounts the operator personally vouches for. A matching account — a
+seed or one the search found — **skips bot detection entirely**: it is recorded as `human` with a
+score of `0.0` and is never filtered out, even when the heuristics would have flagged it.
+
+The entries accept the same handle forms as the seed accounts (`https://x.com/someone`, `@someone`
+and `someone` all refer to the same account), and the match is case-insensitive. The list is a
+bypass, not a candidate source: it never adds an account to the results on its own, it only exempts
+an account that the run would otherwise have assessed.
+
+The suppression list still wins. An account that asked not to be contacted is excluded even when
+the operator also named it as a known human, because the opt-out is permanent.
+
+The run statistics report how many accounts took the bypass as `humans_bypassed`, and the accounts
+themselves carry the `known_human` tag.
 
 ### Bot detection heuristics
 

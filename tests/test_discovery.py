@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -1680,3 +1681,424 @@ async def test_a_new_search_purges_the_previous_runs(
     assert all(
         account.source_run_id == second.run_id for account in remaining_accounts
     )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_new_search_purges_accounts_but_keeps_the_other_tables(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """The purge removes the discovery history and nothing else.
+
+    The old accounts and the old runs are gone, but the data that is not part
+    of the discovery history - the suppression list, the outreach ledger and
+    the cached DM conversations - survives, because a new search is not a
+    reason to forget who opted out or what was already sent.
+    """
+    from sqlalchemy import select
+
+    from app.models import (
+        DiscoveredAccount,
+        DiscoveryRun,
+        DmConversation,
+        DmEvent,
+        OutreachRecord,
+        OutreachStatus,
+        SuppressionEntry,
+    )
+
+    found = _profile("1", "alice_robotics")
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [found], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": [found]})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": ["robotics engineer"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+            "Handle: @alice_robotics": {
+                "is_bot": False,
+                "confidence": 0.95,
+                "reasons": [],
+                "signals_present": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+
+    from app.x.capabilities import capability_probe
+
+    capability_probe.invalidate()
+
+    # The state that must survive the purge.
+    db_session.add(
+        SuppressionEntry(x_user_id="suppressed1", handle="opt_out", reason="asked")
+    )
+    db_session.add(
+        OutreachRecord(
+            id=uuid.uuid4(),
+            x_user_id="recipient1",
+            handle="recipient",
+            status=OutreachStatus.SENT,
+        )
+    )
+    db_session.add(
+        DmConversation(x_user_id="recipient1", conversation_id="conv1")
+    )
+    db_session.add(
+        DmEvent(
+            id="event1",
+            conversation_id="conv1",
+            x_user_id="recipient1",
+            event_type="message",
+        )
+    )
+    await db_session.flush()
+
+    async with XClient(db_session) as client:
+        await run_discovery(
+            db_session,
+            client,
+            target_segment=["robotics engineer"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+
+    # The discovery history is replaced by the new run alone.
+    runs = await db_session.execute(select(DiscoveryRun))
+    remaining_runs = runs.scalars().all()
+    assert len(remaining_runs) == 1
+    assert remaining_runs[0].input_type == "target_segment"
+
+    accounts = await db_session.execute(select(DiscoveredAccount))
+    remaining_accounts = accounts.scalars().all()
+    assert all(account.source_run_id == remaining_runs[0].id for account in remaining_accounts)
+
+    # Everything outside the discovery history is untouched.
+    suppressions = await db_session.execute(select(SuppressionEntry))
+    assert len(suppressions.scalars().all()) == 1
+
+    records = await db_session.execute(select(OutreachRecord))
+    assert len(records.scalars().all()) == 1
+
+    conversations = await db_session.execute(select(DmConversation))
+    assert len(conversations.scalars().all()) == 1
+
+    events = await db_session.execute(select(DmEvent))
+    assert len(events.scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_known_human_seed_skips_bot_detection(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """A seed the operator vouched for is never assessed.
+
+    The seed profile carries every red flag of a bot, so the normal path
+    would filter it out. Because the operator named it as a known human, the
+    bot detection is skipped and the account is returned.
+    """
+    bot_profile = _profile(
+        "seed1",
+        "cryptobot2024",
+        description="crypto airdrop click link in bio",
+        created_at="2024-01-15T00:00:00.000Z",
+        public_metrics={
+            "followers_count": 10,
+            "following_count": 9000,
+            "tweet_count": 800,
+        },
+    )
+    bot_posts = [
+        {
+            "created_at": (datetime.now(UTC) - timedelta(hours=i * 3)).isoformat(),
+            "text": "DM me for crypto signals now",
+            "public_metrics": {
+                "like_count": 0,
+                "reply_count": 0,
+                "retweet_count": 0,
+                "quote_count": 0,
+            },
+        }
+        for i in range(10)
+    ]
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/by/username/[^/]+").mock(
+        return_value=httpx.Response(200, json={"data": bot_profile})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": bot_posts})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(403, json={"errors": [{"message": "not enabled"}]})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    llm = FakeLLM(
+        by_prompt={
+            "Analyze these seed accounts": {
+                "keywords": ["crypto"],
+                "exclude_keywords": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "AI enthusiast",
+                "occupation": "",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.segment.get_llm", lambda: llm)
+
+    # The bot detection must not be called for the known human at all.
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("bot detection must be skipped for a known human")
+
+    monkeypatch.setattr("app.agents.botdetect.get_llm", explode)
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            seed_accounts=["https://x.com/cryptobot2024"],
+            known_human_accounts=["https://x.com/cryptobot2024"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+
+    assert [account["x_user_id"] for account in result.accounts] == ["seed1"]
+    assert result.accounts[0]["bot"]["verdict"] == "human"
+    assert result.accounts[0]["bot"]["score"] == 0.0
+    assert result.seeds_included == 1
+    assert result.bots_filtered == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_known_human_search_hit_skips_bot_detection(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """A searched account the operator vouched for is not assessed either.
+
+    The known-human list is a bypass, not a candidate source: the account has
+    to be found by the search before the bypass applies.
+    """
+    found = _profile(
+        "found1",
+        "spammy_promo",
+        description="DM me for crypto signals",
+        created_at="2024-01-15T00:00:00.000Z",
+        public_metrics={
+            "followers_count": 10,
+            "following_count": 9000,
+            "tweet_count": 800,
+        },
+    )
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [found], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": [found]})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": ["crypto"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "AI enthusiast",
+                "occupation": "",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("bot detection must be skipped for a known human")
+
+    monkeypatch.setattr("app.agents.botdetect.get_llm", explode)
+
+    from app.x.capabilities import capability_probe
+
+    capability_probe.invalidate()
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            target_segment=["crypto"],
+            known_human_accounts=["spammy_promo"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+
+    assert [account["x_user_id"] for account in result.accounts] == ["found1"]
+    assert result.accounts[0]["bot"]["verdict"] == "human"
+    assert result.accounts[0]["bot"]["score"] == 0.0
+    assert result.bots_filtered == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_suppressed_known_human_is_still_excluded(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """The suppression list outranks the known-human bypass.
+
+    An account that asked not to be contacted must never appear in the
+    results, not even when the operator also named it as a known human.
+    """
+    from app.models import SuppressionEntry
+
+    found = _profile("found1", "spammy_promo")
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [found], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": [found]})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+
+    db_session.add(SuppressionEntry(x_user_id="found1", handle="spammy_promo"))
+    await db_session.flush()
+
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": ["crypto"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "AI enthusiast",
+                "occupation": "",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+
+    from app.x.capabilities import capability_probe
+
+    capability_probe.invalidate()
+
+    async with XClient(db_session) as client:
+        result = await run_discovery(
+            db_session,
+            client,
+            target_segment=["crypto"],
+            known_human_accounts=["spammy_promo"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+
+    assert result.accounts == []
+
+
+def test_known_human_matcher_accepts_the_usual_handle_forms() -> None:
+    """The bypass accepts the same handle forms as the seed accounts."""
+    from app.agents.search import KnownHumanMatcher
+
+    matcher = KnownHumanMatcher(["https://x.com/Alice", "@alice", "alice"])
+
+    assert matcher.matches(username="alice")
+    assert matcher.matches(username="Alice")
+    assert matcher.matches(username="alice", x_user_id="123")
+    assert not matcher.matches(username="bob")
+
+
+def test_known_human_matcher_ignores_unparsable_entries() -> None:
+    from app.agents.search import KnownHumanMatcher
+
+    matcher = KnownHumanMatcher(["", "not a url", "https://example.com/x"])
+
+    assert not matcher
+    assert not matcher.matches(username="alice")

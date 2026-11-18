@@ -32,6 +32,13 @@ class DiscoveryRequest(ApiModel):
             "Their bios and posts are analysed to derive a target segment."
         ),
     )
+    known_human_accounts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "X profile URLs of accounts the operator knows to be human. "
+            "A matching account skips bot detection entirely."
+        ),
+    )
     max_accounts: int = Field(default=40, ge=1, le=200)
     max_candidates: int = Field(default=150, ge=1, le=500)
     max_posts_per_account: int = Field(default=20, ge=0, le=100)
@@ -46,7 +53,7 @@ class DiscoveryRequest(ApiModel):
         description="Accounts scoring at or above this are treated as bots.",
     )
 
-    @field_validator("target_segment", "seed_accounts")
+    @field_validator("target_segment", "seed_accounts", "known_human_accounts")
     @classmethod
     def _strip_and_dedupe(cls, values: list[str]) -> list[str]:
         seen: set[str] = set()
