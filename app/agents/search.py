@@ -27,6 +27,7 @@ from app.agents.segment import (
 )
 from app.config import Settings, get_settings
 from app.models import BotVerdict, DiscoveredAccount, DiscoveryRun
+from app.services.cleanup import purge_discovery_history
 from app.x.capabilities import Capabilities, capability_probe
 from app.x.client import XClient
 from app.x.errors import XApiError
@@ -163,6 +164,10 @@ async def run_discovery(
         post_read_cost_usd=settings.post_read_cost_usd,
         user_read_cost_usd=settings.user_read_cost_usd,
     )
+
+    # Every new search starts from an empty history: the previous runs and
+    # the accounts they produced are removed first.
+    await purge_discovery_history(session)
 
     run = DiscoveryRun(
         input_type=_input_type(target_segment, seed_accounts),

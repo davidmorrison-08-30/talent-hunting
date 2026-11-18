@@ -321,6 +321,91 @@ async def test_oauth_disconnect_clears_the_token(client: AsyncClient, db_session
     assert await db_session.get(OAuthToken, "self") is None
 
 
+@pytest.mark.asyncio
+async def test_oauth_disconnect_clears_all_operator_data(
+    client: AsyncClient, db_session
+) -> None:
+    """Disconnect removes every trace of the operator except the opt-outs.
+
+    The permanent opt-out list and the daily rate budget survive, so people
+    who opted out stay excluded and the daily caps cannot be reset.
+    """
+    from sqlalchemy import select
+
+    from app.models import (
+        DiscoveredAccount,
+        DiscoveryRun,
+        DmConversation,
+        DmEvent,
+        OAuthState,
+        OutreachRecord,
+        RateBudget,
+        SuppressionEntry,
+    )
+
+    run = DiscoveryRun(
+        id=uuid.uuid4(),
+        input_type="seed_accounts",
+        target_segment=["robotics"],
+        seed_accounts=["https://x.com/alice"],
+        status="COMPLETED",
+        stats={},
+    )
+    db_session.add(run)
+    db_session.add(
+        OAuthToken(
+            x_user_id="self",
+            access_token="a",
+            refresh_token="r",
+            scopes="tweet.read",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.add(OAuthState(state="s1", code_verifier="v"))
+    db_session.add(
+        DiscoveredAccount(
+            x_user_id="u1",
+            username="alice",
+            source_run_id=run.id,
+        )
+    )
+    db_session.add(
+        OutreachRecord(x_user_id="u1", handle="alice", status="DRAFT")
+    )
+    db_session.add(DmConversation(x_user_id="u1", conversation_id="c1"))
+    db_session.add(
+        DmEvent(id="e1", conversation_id="c1", x_user_id="u1", event_type="MessageCreate")
+    )
+    # These two must survive the disconnect.
+    db_session.add(SuppressionEntry(x_user_id="u2", handle="bob", reason="asked"))
+    db_session.add(
+        RateBudget(day=datetime.now(UTC).strftime("%Y-%m-%d"), dm_sent_count=7)
+    )
+    await db_session.flush()
+
+    response = await client.get("/auth/x/disconnect")
+    assert response.status_code == 200
+
+    assert await db_session.get(OAuthToken, "self") is None
+    for model in (
+        OAuthState,
+        DiscoveredAccount,
+        OutreachRecord,
+        DmConversation,
+        DmEvent,
+        DiscoveryRun,
+    ):
+        remaining = await db_session.execute(select(model))
+        assert remaining.scalars().all() == [], model.__tablename__
+
+    # The opt-out list and the daily budget are kept.
+    assert await db_session.get(SuppressionEntry, "u2") is not None
+    budget_result = await db_session.execute(select(RateBudget))
+    budgets = budget_result.scalars().all()
+    assert len(budgets) == 1
+    assert budgets[0].dm_sent_count == 7
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------

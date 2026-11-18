@@ -17,6 +17,7 @@ from app.agents.queries import (
 )
 from app.agents.search import SearchLimits, run_discovery
 from app.agents.segment import parse_seed_handle
+from app.x.capabilities import capability_probe
 from app.x.client import XClient
 
 
@@ -1389,3 +1390,99 @@ async def test_zero_posts_per_account_skips_the_timeline_read(
 
     assert timeline.call_count == 0
     assert result.estimated_cost_usd < 0.1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_new_search_purges_the_previous_runs(
+    db_session, auth_token, monkeypatch
+) -> None:
+    """Every new search starts from an empty discovery history.
+
+    The previous runs and the accounts they produced are removed, so only the
+    latest run and its accounts remain visible.
+    """
+    from sqlalchemy import select
+
+    from app.models import DiscoveredAccount, DiscoveryRun
+
+    found = _profile("1", "alice_robotics")
+
+    respx.get("https://api.x.com/2/users/me").mock(
+        return_value=httpx.Response(200, json={"data": {"id": "self"}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/recent").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/tweets/search/all").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users/search").mock(
+        return_value=httpx.Response(200, json={"data": [found], "meta": {}})
+    )
+    respx.get("https://api.x.com/2/users").mock(
+        return_value=httpx.Response(200, json={"data": [found]})
+    )
+    respx.get(url__regex=r"https://api\.x\.com/2/users/[^/]+/tweets").mock(
+        return_value=httpx.Response(200, json={"data": _posts(3)})
+    )
+
+    llm = FakeLLM(
+        by_prompt={
+            "Build a search plan": {
+                "user_queries": ["robotics engineer"],
+                "post_queries": [],
+                "rationale": "r",
+            },
+            "Extract key information about this person": {
+                "bio": "Robotics engineer",
+                "occupation": "Robotics Engineer",
+                "titles": [],
+                "specializations": [],
+                "interests": [],
+                "milestones": [],
+                "future_plans": [],
+                "evidence": [],
+            },
+            "Handle: @alice_robotics": {
+                "is_bot": False,
+                "confidence": 0.95,
+                "reasons": [],
+                "signals_present": [],
+            },
+        }
+    )
+    monkeypatch.setattr("app.agents.queries.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.profile.get_llm", lambda: llm)
+    monkeypatch.setattr("app.agents.botdetect.get_llm", lambda: llm)
+
+    capability_probe.invalidate()
+
+    async with XClient(db_session) as client:
+        first = await run_discovery(
+            db_session,
+            client,
+            target_segment=["robotics engineer"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+        second = await run_discovery(
+            db_session,
+            client,
+            target_segment=["robotics engineer"],
+            limits=SearchLimits(max_accounts=5, max_candidates=5),
+        )
+
+    # Only the second run survives.
+    runs = await db_session.execute(select(DiscoveryRun))
+    remaining_runs = runs.scalars().all()
+    assert len(remaining_runs) == 1
+    assert remaining_runs[0].id == second.run_id
+    assert remaining_runs[0].id != first.run_id
+
+    # The accounts of the first run are gone with it.
+    accounts = await db_session.execute(select(DiscoveredAccount))
+    remaining_accounts = accounts.scalars().all()
+    assert len(remaining_accounts) == len(second.accounts)
+    assert all(
+        account.source_run_id == second.run_id for account in remaining_accounts
+    )

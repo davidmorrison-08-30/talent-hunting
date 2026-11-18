@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 
+import structlog
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +20,8 @@ from app.x.auth import (
     generate_code_verifier,
     store_oauth_state,
 )
+
+log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/auth/x", tags=["auth"])
 
@@ -101,10 +104,22 @@ async def status(
 async def disconnect(
     session: AsyncSession = Depends(get_session),
 ) -> JSONResponse:
-    """Delete the stored token so a different account can be connected."""
-    from sqlalchemy import delete
+    """Disconnect the account and delete everything it left behind.
 
-    from app.models import OAuthToken
+    The stored token is removed so a different account can be connected, and
+    the runs, discovered accounts, outreach drafts and DM history that belong
+    to this operator are deleted with it. The permanent opt-out list and the
+    daily rate budget survive, so people who opted out stay excluded and the
+    daily send and read caps cannot be reset by reconnecting.
+    """
+    from app.services.cleanup import clear_operator_data
+    from app.x.capabilities import capability_probe
 
-    await session.execute(delete(OAuthToken))
+    counts = await clear_operator_data(session)
+
+    # The cached capabilities describe the account that just disconnected, so
+    # the next connection probes its own.
+    capability_probe.invalidate()
+
+    log.info("x_account_disconnected", **counts)
     return JSONResponse(status_code=200, content={"detail": "Disconnected"})
