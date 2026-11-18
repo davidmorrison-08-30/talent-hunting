@@ -13,26 +13,21 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.search import SearchLimits, run_discovery
+from app.agents.search import SearchLimits
 from app.config import Settings, get_settings
 from app.db import get_session
 from app.errors import NotFoundError, ValidationError
 from app.models import DiscoveredAccount, DiscoveryRun, SuppressionEntry
 from app.schemas import (
     AccountRecord,
+    DiscoveryAccepted,
     DiscoveryRequest,
-    DiscoveryResponse,
     DiscoveryRunSummary,
-    DiscoveryStats,
-    QueryUsed,
-)
-from app.schemas import (
-    DiscoveredAccount as DiscoveredAccountSchema,
 )
 from app.schemas import (
     KeyInformation as KeyInformationSchema,
 )
-from app.x.client import XClient
+from app.services.search_runner import start_run
 
 router = APIRouter(prefix="/api/v1/discovery", tags=["discovery"])
 
@@ -61,19 +56,22 @@ def _to_account_record(account: DiscoveredAccount) -> AccountRecord:
 
 @router.post(
     "/search",
-    response_model=DiscoveryResponse,
-    summary="Find X accounts matching a target segment and/or seed accounts",
+    response_model=DiscoveryAccepted,
+    status_code=202,
+    summary="Start a discovery search for accounts matching a segment and/or seeds",
 )
 async def search_accounts(
     request: DiscoveryRequest,
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
-) -> DiscoveryResponse:
-    """Search for accounts and return the real (non-bot) ones.
+) -> DiscoveryAccepted:
+    """Start a discovery search and return the run to poll.
 
-    Supply ``target_segment`` with descriptive keywords, ``seed_accounts`` with
-    X profile URLs, or both. When seeds are given, their bios and posts are
-    analysed and merged into the target segment.
+    The search waits on the X API and on several LLM inferences, which takes
+    much longer than an API Gateway integration may hold a connection open.
+    The request therefore only records the run and returns immediately; the
+    caller polls ``GET /api/v1/discovery/runs/{run_id}`` until the run leaves
+    the running state and then reads the accounts it found.
     """
     if not request.target_segment and not request.seed_accounts:
         raise ValidationError(
@@ -89,37 +87,20 @@ async def search_accounts(
         user_read_cost_usd=settings.user_read_cost_usd,
     )
 
-    async with XClient(session) as client:
-        result = await run_discovery(
-            session,
-            client,
-            target_segment=request.target_segment,
-            seed_accounts=request.seed_accounts,
-            limits=limits,
-            settings=settings,
-            include_bots=request.include_bots,
-            bot_score_threshold=request.bot_score_threshold,
-        )
+    run_id = await start_run(
+        session,
+        target_segment=request.target_segment,
+        seed_accounts=request.seed_accounts,
+        limits=limits,
+        settings=settings,
+        include_bots=request.include_bots,
+        bot_score_threshold=request.bot_score_threshold,
+    )
 
-    return DiscoveryResponse(
-        run_id=result.run_id,
-        target_segment=result.target_segment.keywords,
-        segment_rationale=result.target_segment.rationale,
-        queries_used=[QueryUsed(**q) for q in result.query_plan.to_payload()],
-        accounts=[DiscoveredAccountSchema(**account) for account in result.accounts],
-        stats=DiscoveryStats(
-            candidates=result.candidates_seen,
-            bots_filtered=result.bots_filtered,
-            returned=len(result.accounts),
-            api_calls=result.api_calls,
-            estimated_cost_usd=round(result.estimated_cost_usd, 4),
-            seeds_supplied=len(request.seed_accounts),
-            seeds_resolved=result.seeds_resolved,
-            seeds_included=result.seeds_included,
-            seeds_dropped=result.seeds_dropped,
-        ),
-        capabilities=result.capabilities,
-        warnings=result.warnings,
+    return DiscoveryAccepted(
+        run_id=run_id,
+        status="RUNNING",
+        poll_url=f"/api/v1/discovery/runs/{run_id}",
     )
 
 

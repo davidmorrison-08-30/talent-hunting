@@ -7,6 +7,7 @@ injection and the response models without touching the network.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
@@ -421,18 +422,28 @@ async def test_discovery_search_requires_a_segment_or_seeds(client: AsyncClient)
 async def test_discovery_search_returns_accounts(
     client: AsyncClient, db_session, auth_token, monkeypatch
 ) -> None:
+    """The search is acknowledged at once and its accounts are read afterwards.
+
+    A discovery run waits on the X API and on several LLM inferences, so it
+    runs in the background: the request answers ``202`` with the run to poll
+    and the accounts show up once the run has finished.
+    """
     from app.agents import search as search_agent
 
     async def _fake_run(session, client_, **kwargs):  # type: ignore[no-untyped-def]
-        run = DiscoveryRun(
-            id=uuid.uuid4(),
-            input_type="segment",
-            target_segment=["robotics"],
-            seed_accounts=[],
-            status="completed",
-            stats={},
-        )
-        session.add(run)
+        run = kwargs["run_id"]
+        record = await session.get(DiscoveryRun, run)
+        if record is not None:
+            record.status = "COMPLETED"
+            record.stats = {
+                "candidates": 0,
+                "bots_filtered": 0,
+                "returned": 1,
+                "seeds_supplied": 1,
+                "seeds_resolved": 1,
+                "seeds_included": 1,
+                "seeds_dropped": 0,
+            }
         account = DiscoveredAccount(
             x_user_id="u1",
             username="alice",
@@ -446,12 +457,12 @@ async def test_discovery_search_returns_accounts(
             bot_reasons=[],
             key_info={"summary": "Builds robot arms"},
             segment_tags=["robotics"],
-            source_run_id=run.id,
+            source_run_id=run,
         )
         session.add(account)
         await session.flush()
         return search_agent.DiscoveryResult(
-            run_id=run.id,
+            run_id=run,
             target_segment=search_agent.TargetSegment(
                 keywords=["robotics"], rationale="Because robotics"
             ),
@@ -493,39 +504,57 @@ async def test_discovery_search_returns_accounts(
             warnings=[],
         )
 
-    monkeypatch.setattr("app.api.discovery.run_discovery", _fake_run)
+    monkeypatch.setattr("app.services.search_runner.run_discovery", _fake_run)
 
     response = await client.post(
         "/api/v1/discovery/search", json={"target_segment": ["robotics engineers"]}
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
     body = response.json()
-    assert body["stats"]["returned"] == 1
-    assert body["accounts"][0]["username"] == "alice"
-    assert body["target_segment"] == ["robotics"]
-    assert body["accounts"][0]["origin"] == "search"
+    assert body["status"] == "RUNNING"
+    run_id = body["run_id"]
+    assert body["poll_url"].endswith(run_id)
+
+    # The work runs in the background, so the run is polled until it finishes.
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        run_response = await client.get(f"/api/v1/discovery/runs/{run_id}")
+        if run_response.json()["status"] != "RUNNING":
+            break
+    assert run_response.status_code == 200
+    assert run_response.json()["status"] == "COMPLETED"
+
+    accounts = await client.get("/api/v1/discovery/accounts")
+    assert accounts.status_code == 200
+    body = accounts.json()
+    assert len(body) == 1
+    assert body[0]["username"] == "alice"
 
 
 @pytest.mark.asyncio
 async def test_discovery_search_reports_the_seed_accounts(
     client: AsyncClient, db_session, auth_token, monkeypatch
 ) -> None:
-    """The response reports how the seed accounts were treated."""
+    """The run reports how the seed accounts were treated."""
     from app.agents import search as search_agent
 
     async def _fake_run(session, client_, **kwargs):  # type: ignore[no-untyped-def]
-        run = DiscoveryRun(
-            id=uuid.uuid4(),
-            input_type="seed_accounts",
-            target_segment=[],
-            seed_accounts=["https://x.com/alice"],
-            status="completed",
-            stats={},
-        )
-        session.add(run)
+        run = kwargs["run_id"]
+        record = await session.get(DiscoveryRun, run)
+        if record is not None:
+            record.status = "COMPLETED"
+            record.stats = {
+                "candidates": 0,
+                "bots_filtered": 0,
+                "returned": 1,
+                "seeds_supplied": 1,
+                "seeds_resolved": 1,
+                "seeds_included": 1,
+                "seeds_dropped": 0,
+            }
         await session.flush()
         return search_agent.DiscoveryResult(
-            run_id=run.id,
+            run_id=run,
             target_segment=search_agent.TargetSegment(keywords=[]),
             query_plan=search_agent.QueryPlan(),
             accounts=[
@@ -543,18 +572,25 @@ async def test_discovery_search_reports_the_seed_accounts(
             seeds_dropped=0,
         )
 
-    monkeypatch.setattr("app.api.discovery.run_discovery", _fake_run)
+    monkeypatch.setattr("app.services.search_runner.run_discovery", _fake_run)
 
     response = await client.post(
         "/api/v1/discovery/search", json={"seed_accounts": ["https://x.com/alice"]}
     )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["accounts"][0]["origin"] == "seed"
-    assert body["stats"]["seeds_supplied"] == 1
-    assert body["stats"]["seeds_resolved"] == 1
-    assert body["stats"]["seeds_included"] == 1
-    assert body["stats"]["seeds_dropped"] == 0
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        run_response = await client.get(f"/api/v1/discovery/runs/{run_id}")
+        if run_response.json()["status"] != "RUNNING":
+            break
+
+    stats = run_response.json()["stats"]
+    assert stats["seeds_supplied"] == 1
+    assert stats["seeds_resolved"] == 1
+    assert stats["seeds_included"] == 1
+    assert stats["seeds_dropped"] == 0
 
 
 @pytest.mark.asyncio

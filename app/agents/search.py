@@ -150,6 +150,7 @@ async def run_discovery(
     session: AsyncSession,
     client: XClient,
     *,
+    run_id: uuid.UUID | None = None,
     target_segment: list[str] | None = None,
     seed_accounts: list[str] | None = None,
     limits: SearchLimits | None = None,
@@ -157,7 +158,12 @@ async def run_discovery(
     include_bots: bool = False,
     bot_score_threshold: float = 0.6,
 ) -> DiscoveryResult:
-    """Run the full discovery flow and persist the results."""
+    """Run the full discovery flow and persist the results.
+
+    ``run_id`` reuses a run row that was created before the work started, so
+    the caller can poll that run while the search is still going. Without it
+    a new run is created here.
+    """
     settings = settings or get_settings()
     limits = limits or SearchLimits(
         spend_ceiling_usd=settings.discovery_spend_ceiling_usd,
@@ -169,13 +175,27 @@ async def run_discovery(
     # the accounts they produced are removed first.
     await purge_discovery_history(session)
 
-    run = DiscoveryRun(
-        input_type=_input_type(target_segment, seed_accounts),
-        target_segment=list(target_segment or []),
-        seed_accounts=list(seed_accounts or []),
-        status="RUNNING",
-    )
-    session.add(run)
+    if run_id is None:
+        run = DiscoveryRun(
+            input_type=_input_type(target_segment, seed_accounts),
+            target_segment=list(target_segment or []),
+            seed_accounts=list(seed_accounts or []),
+            status="RUNNING",
+        )
+        session.add(run)
+    else:
+        existing = await session.get(DiscoveryRun, run_id)
+        if existing is not None:
+            run = existing
+        else:
+            run = DiscoveryRun(
+                id=run_id,
+                input_type=_input_type(target_segment, seed_accounts),
+                target_segment=list(target_segment or []),
+                seed_accounts=list(seed_accounts or []),
+                status="RUNNING",
+            )
+            session.add(run)
     await session.flush()
 
     warnings: list[str] = []

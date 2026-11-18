@@ -111,12 +111,29 @@ class BedrockLLM:
         return _extract_tool_input(response)
 
     async def _converse(self, client: Any, request: dict[str, Any]) -> dict[str, Any]:
-        """Call Bedrock, running the blocking SDK call in a worker thread."""
+        """Call Bedrock, running the blocking SDK call in a worker thread.
+
+        The call is bounded by ``llm_timeout_seconds``. Without a bound a
+        stalled Bedrock request would hold the HTTP request open until the
+        API Gateway gives up on it, and the caller would never learn what
+        happened.
+        """
         last_error: Exception | None = None
+        timeout = self.settings.llm_timeout_seconds
 
         for attempt in range(2):
             try:
-                return await asyncio.to_thread(client.converse, **request)
+                return await asyncio.wait_for(
+                    asyncio.to_thread(client.converse, **request),
+                    timeout=timeout,
+                )
+            except TimeoutError:
+                last_error = LLMError(
+                    "AWS Bedrock inference timed out",
+                    details={"timeout_seconds": timeout},
+                )
+                log.warning("bedrock_timeout", attempt=attempt, timeout_seconds=timeout)
+                break
             except Exception as exc:
                 last_error = exc
                 if _is_throttling(exc) and attempt == 0:

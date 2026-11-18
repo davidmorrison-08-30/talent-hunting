@@ -64,6 +64,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             dispatcher.start(settings)
             log.info("dispatcher_enabled")
 
+        # A discovery run is executed in the background, so a run that was
+        # still in flight when the task stopped is picked up again here.
+        if settings.enable_dispatcher:
+            from app.services.search_runner import resume_pending
+
+            await resume_pending(settings)
+            log.info("discovery_resume_checked")
+
         yield
     finally:
         if settings.enable_dispatcher:

@@ -97,6 +97,13 @@ class Settings(BaseSettings):
     post_read_cost_usd: float = 0.005
     user_read_cost_usd: float = 0.010
 
+    # --- Discovery defaults ----------------------------------------------
+    # The defaults a background discovery run uses when the request does not
+    # pin its own limits, and the bounds the request is validated against.
+    discovery_max_accounts: int = Field(default=40, ge=1, le=200)
+    discovery_max_candidates: int = Field(default=150, ge=1, le=500)
+    discovery_max_posts_per_account: int = Field(default=20, ge=0, le=100)
+
     # --- Runtime knobs ---------------------------------------------------
     run_migrations_on_startup: bool = True
     enable_dispatcher: bool = Field(

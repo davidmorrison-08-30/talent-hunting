@@ -134,6 +134,20 @@ class DiscoveryResponse(ApiModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class DiscoveryAccepted(ApiModel):
+    """The acknowledgement of a search that is still running.
+
+    A discovery run waits on the X API and on several LLM inferences, which
+    takes longer than an API Gateway integration may hold a connection open.
+    The search is therefore started in the background and the caller polls
+    ``poll_url`` until the run leaves the running state.
+    """
+
+    run_id: uuid.UUID
+    status: str = "RUNNING"
+    poll_url: str = ""
+
+
 class DiscoveryRunSummary(ApiModel):
     id: uuid.UUID
     input_type: str
