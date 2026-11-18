@@ -268,7 +268,7 @@ class XClient:
                 "/2/users/by/username/:username",
                 path_params={"username": username},
                 params={
-                    "usernames": username,
+                    "username": username,
                     "user.fields": USER_FIELDS,
                     "expansions": USER_EXPANSIONS,
                     "tweet.fields": TWEET_FIELDS,
