@@ -23,7 +23,6 @@ log = structlog.get_logger(__name__)
 #: Statuses that block any further outreach to the same recipient.
 BLOCKING_STATUSES = (
     OutreachStatus.PENDING_APPROVAL.value,
-    OutreachStatus.APPROVED.value,
     OutreachStatus.SENT.value,
     OutreachStatus.OPTED_OUT.value,
 )

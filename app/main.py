@@ -55,29 +55,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("migrations_complete")
 
     try:
-        # The drip dispatcher is what drains approved-but-unsent messages. It
-        # is started here so a restarted task picks up whatever was left in
-        # the APPROVED state without an operator calling /dispatch/resume.
-        if settings.enable_dispatcher:
-            from app.services.dispatcher import dispatcher
-
-            dispatcher.start(settings)
-            log.info("dispatcher_enabled")
-
         # A discovery run is executed in the background, so a run that was
         # still in flight when the task stopped is picked up again here.
-        if settings.enable_dispatcher:
-            from app.services.search_runner import resume_pending
+        from app.services.search_runner import resume_pending
 
-            await resume_pending(settings)
-            log.info("discovery_resume_checked")
+        await resume_pending(settings)
+        log.info("discovery_resume_checked")
 
         yield
     finally:
-        if settings.enable_dispatcher:
-            from app.services.dispatcher import dispatcher
-
-            await dispatcher.stop()
         await dispose_engine()
         log.info("shutdown")
 

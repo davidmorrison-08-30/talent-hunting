@@ -2,7 +2,7 @@
 
 A FastAPI service that **finds real (non-bot) accounts on X** from a target segment or a set of seed
 accounts, and **chats with them under human approval** — evidence-grounded drafts, a mandatory review
-queue, paced dispatch, a hard dedup ledger and a permanent opt-out list.
+step, paced dispatch, a hard dedup ledger and a permanent opt-out list.
 
 Everything is built around the compliance rules in [`build-docs/`](build-docs/): no message is ever sent
 without a human approving it, no recipient is ever contacted twice, no suppressed account is ever
@@ -50,7 +50,6 @@ contacted at all, and no burst of messages ever leaves the service.
                          │  app/services/dedup    → hard dedup lock  │
                          │  app/services/suppression → opt-out list  │
                          │  app/services/pacing   → cap + delays     │
-                         │  app/services/dispatcher → drip queue     │
                          │  app/services/conversations → DM events   │
                          └───────────┬───────────────────┬──────────┘
                                      │                   │
@@ -271,14 +270,14 @@ endpoint, estimated cost), live `capabilities` and any `warnings`.
 |---|---|---|
 | `POST` | `/api/v1/outreach/drafts` | Draft a grounded DM and park it in `PENDING_APPROVAL`. |
 | `GET` | `/api/v1/outreach/drafts` | List outreach records (filter by status / recipient). |
+| `GET` | `/api/v1/outreach/drafts/current?x_user_id=…` | The one draft an account is waiting for a decision on. |
 | `GET` | `/api/v1/outreach/drafts/{record_id}` | One record with its evidence snapshot. |
+| `DELETE` | `/api/v1/outreach/drafts/{record_id}` | Discard an unapproved draft (a sent record is never deleted). |
 | `POST` | `/api/v1/outreach/drafts/{record_id}/approve` | Approve and send (paced). |
 | `POST` | `/api/v1/outreach/drafts/{record_id}/deny` | Reject with feedback and get a revision. |
 | `POST` | `/api/v1/outreach/poll-events` | Poll for inbound replies; drafts responses for approval. |
-| `POST` | `/api/v1/outreach/dispatch/resume` | Restart the drip dispatcher and drain anything left queued. |
-| `GET` | `/api/v1/outreach/queue` | Everything awaiting a human decision. |
 | `GET` | `/api/v1/outreach/budget` | Today's dispatch and read budget. |
-| `GET` | `/api/v1/outreach/conversations/{x_user_id}` | The cached DM history with one recipient. |
+| `GET` | `/api/v1/outreach/conversations/{x_user_id}` | The cached DM history with one recipient, both directions. |
 
 Draft request:
 
@@ -289,9 +288,10 @@ Draft request:
 The response carries the draft text, the citations it relied on, the full evidence snapshot and the
 DM conversation history so the reviewer can judge the personalization.
 
-`approve` accepts `?dispatch=blocking` (default — sends inside the request, honouring the randomized
-30–90 s delay) or `?dispatch=queued` (hands the record to the in-process drip dispatcher, which
-sends sequentially with the same pacing and survives restarts because the queue lives in Postgres).
+`approve` sends inside the request, honouring the randomized 30–90 s delay. There is no background
+dispatcher and no global approval queue: each account has at most one unapproved draft, and
+`GET /drafts/current` returns it. Moving to another account deletes the unapproved draft through
+`DELETE /drafts/{record_id}`.
 
 ### Compliance
 
@@ -441,10 +441,10 @@ combined into a single score with the reasons preserved.
 
 | Rule from `build-docs/x-rules-and-limits.md` | How it is enforced |
 |---|---|
-| Mandatory human approval queue | Every draft starts in `PENDING_APPROVAL`; the only path to `SENT` is an explicit approve call. |
+| Mandatory human approval | Every draft starts in `PENDING_APPROVAL`; the only path to `SENT` is an explicit approve call. |
 | Evidence-backed personalization | The prompt requires concrete cited details; the response carries the citations and the evidence snapshot for review. |
 | Hard deduplication lock | A partial unique index on `outreach_records(x_user_id)` where the status is live, plus a service-level check before drafting *and* again before sending. |
-| Paced dispatch (drip queue) | Randomized 30–90 s delay per send; `dispatch=queued` drains sequentially, never in a burst. |
+| Paced dispatch | Randomized 30–90 s delay per send, so messages never leave the service in a burst. |
 | Opt-out / suppression list | `POST /api/v1/suppressions` blocks all future outreach permanently, cancels any pending draft, and removes the account from discovery results. |
 | No copypasta | Every send is compared against recently sent bodies; a near-duplicate is rejected back to `PENDING_APPROVAL` with a note. |
 | No link-only spam | Explicitly forbidden by the prompt; the draft must carry real context. |
@@ -557,18 +557,15 @@ sending account and the developer app.
 4. **Use `include_bots=false` and a low `max_accounts`** — a smaller blast radius is a safer blast
    radius.
 
-5. **Prefer `dispatch=queued` for the first sends** so you can watch the drip dispatcher work and stop
-   it between messages.
+5. **Watch the pacing delay work** — each send waits the randomized delay, so a test run is slower
+   than the API calls suggest.
 
 6. **Never disable the pacing delay or the daily cap** to "make a test faster". Set
    `DM_MIN_DELAY_SECONDS` / `DM_MAX_DELAY_SECONDS` low *in your local `.env` only* if you must, and
    keep `DM_DAILY_CAP` realistic.
 
-7. **After a restart, resume the queue explicitly** if you had queued sends in flight:
-
-   ```bash
-   curl -X POST http://localhost:8000/api/v1/outreach/dispatch/resume
-   ```
+7. **After a restart, nothing is in flight** — every send happens inside the approve request, so a
+   restarted service has no queued messages to recover.
 
 ### Other guardrails
 
@@ -603,7 +600,7 @@ Coverage highlights:
 | `tests/test_discovery.py` | Segment derivation, query formation and sanitization, each bot heuristic, the hybrid verdict, key-information extraction, the full search loop. |
 | `tests/test_outreach.py` | Dedup lock, suppression, daily cap, pacing window, drafting, denial → revision, approval and send, `403` → `BLOCKED`, copypasta rejection. |
 | `tests/test_api.py` | Every route: validation, status codes, response shapes, the error envelope, OAuth start/status/disconnect. |
-| `tests/test_services.py` | Rate limiting (sliding window, server headers, daily ceiling), PKCE helpers, token refresh, DM event polling, the drip dispatcher, budget rollover. |
+| `tests/test_services.py` | Rate limiting (sliding window, server headers, daily ceiling), PKCE helpers, token refresh, DM event polling, the outbound message cache, budget rollover. |
 
 Quality gates:
 
@@ -644,14 +641,12 @@ app/
     dedup.py           The hard dedup ledger
     suppression.py     The permanent opt-out list
     pacing.py          Daily cap and randomized inter-send delay
-    dispatcher.py      The in-process drip dispatcher
     conversations.py   DM conversation and event state
   api/
     health.py          Liveness, detailed health, capability probe
     auth_routes.py     OAuth routes
     discovery.py       ENDPOINT I
-    outreach.py        ENDPOINT II and the approval endpoints
-    compliance.py      Suppression list and the outreach ledger
+    outreach.py        ENDPOINT II and the approval endpoints    compliance.py      Suppression list and the outreach ledger
 alembic/               Migrations
 build-docs/            The source requirements this service implements
 scripts/               Development guardrail helpers

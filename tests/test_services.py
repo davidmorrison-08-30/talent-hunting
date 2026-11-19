@@ -1,4 +1,4 @@
-"""Tests for the supporting services: rate limiting, auth, conversations, dispatcher."""
+"""Tests for the supporting services: rate limiting, auth, conversations."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from app.config import get_settings
 from app.errors import UpstreamError
 from app.models import DmConversation, OAuthToken, OutreachStatus
 from app.services import conversations as conversation_service
-from app.services import dispatcher as dispatcher_service
 from app.services import pacing, suppression
 from app.x import auth as x_auth
 from app.x.client import XClient
@@ -398,70 +397,103 @@ async def test_mark_conversation_read_clears_the_unread_flag(
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher
+# Outbound message cache
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_enqueue_marks_the_record_approved(db_session: AsyncSession) -> None:
-    from uuid import uuid4
-
-    from app.models import OutreachRecord
-
-    record = OutreachRecord(
-        id=uuid4(),
+async def test_outbound_message_is_cached(
+    db_session: AsyncSession, auth_token
+) -> None:
+    """A message the operator sent is cached so the history is complete."""
+    await conversation_service.cache_outbound_message(
+        db_session,
         x_user_id="u1",
-        status=OutreachStatus.PENDING_APPROVAL.value,
-        draft_versions=[],
-        evidence_snapshot={},
-        feedback=[],
+        text="hi, I am the operator",
+        x_message_id="msg-1",
     )
-    db_session.add(record)
-    await db_session.flush()
 
-    await dispatcher_service.enqueue(db_session, record.id)
-
-    assert record.status == OutreachStatus.APPROVED.value
+    history = await conversation_service.conversation_history(db_session, "u1")
+    assert len(history) == 1
+    assert history[0]["text"] == "hi, I am the operator"
+    assert history[0]["outbound"] is True
+    assert history[0]["sender_id"] == auth_token.x_user_id
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_drains_approved_records(
-    db_session: AsyncSession, monkeypatch
+async def test_outbound_message_reuses_the_known_conversation(
+    db_session: AsyncSession, auth_token
 ) -> None:
-    """The dispatcher sends APPROVED records one at a time."""
-    from uuid import uuid4
-
-    from app.models import OutreachRecord
-
-    sent: list[str] = []
-
-    async def _fake_send(session, client, *, record, settings=None, apply_pacing_delay=True):  # type: ignore[no-untyped-def]
-        sent.append(record.x_user_id)
-        record.status = OutreachStatus.SENT.value
-        await session.flush()
-        return dispatcher_service.draft_agent.SendOutcome(
-            record_id=record.id,
-            x_user_id=record.x_user_id,
-            status=OutreachStatus.SENT.value,
-        )
-
-    monkeypatch.setattr(dispatcher_service.draft_agent, "approve_and_send", _fake_send)
-    monkeypatch.setattr(
-        dispatcher_service, "get_sessionmaker", lambda: db_session_maker(db_session)
+    """The cached message joins the conversation that was seen before."""
+    db_session.add(
+        DmConversation(x_user_id="u1", conversation_id="c1", unread_inbound=False)
     )
-
-    record = OutreachRecord(
-        id=uuid4(),
-        x_user_id="u1",
-        status=OutreachStatus.APPROVED.value,
-        draft_versions=[{"version": 1, "text": "hi"}],
-        evidence_snapshot={},
-        feedback=[],
-    )
-    db_session.add(record)
     await db_session.flush()
 
-    count = await dispatcher_service.dispatcher._drain_once(_settings())
-    assert count == 1
-    assert sent == ["u1"]
+    await conversation_service.cache_outbound_message(
+        db_session,
+        x_user_id="u1",
+        text="hello",
+        x_message_id="msg-1",
+    )
+
+    history = await conversation_service.conversation_history(db_session, "u1")
+    assert history[0]["id"] == "msg-1"
+
+    conversation = await db_session.get(DmConversation, "u1")
+    assert conversation is not None
+    assert conversation.conversation_id == "c1"
+
+
+@pytest.mark.asyncio
+async def test_caching_an_outbound_message_twice_keeps_one_row(
+    db_session: AsyncSession, auth_token
+) -> None:
+    """Re-caching the same message id does not duplicate the history."""
+    for _ in range(2):
+        await conversation_service.cache_outbound_message(
+            db_session,
+            x_user_id="u1",
+            text="hello",
+            x_message_id="msg-1",
+        )
+
+    history = await conversation_service.conversation_history(db_session, "u1")
+    assert len(history) == 1
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_keeps_both_directions_in_order(
+    db_session: AsyncSession, auth_token
+) -> None:
+    """Inbound and outbound messages are interleaved oldest first."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models import DmEvent
+
+    now = datetime.now(UTC)
+    db_session.add(
+        DmEvent(
+            id="evt-in",
+            conversation_id="c1",
+            x_user_id="u1",
+            sender_id="u1",
+            text="are you there?",
+            event_type="MessageCreate",
+            created_at=now - timedelta(minutes=2),
+        )
+    )
+    await db_session.flush()
+
+    await conversation_service.cache_outbound_message(
+        db_session,
+        x_user_id="u1",
+        text="yes I am",
+        x_message_id="msg-1",
+        sent_at=now - timedelta(minutes=1),
+    )
+
+    history = await conversation_service.conversation_history(db_session, "u1")
+    assert [row["text"] for row in history] == ["are you there?", "yes I am"]
+    assert [row["outbound"] for row in history] == [False, True]
 
 
 def db_session_maker(session: AsyncSession):  # type: ignore[no-untyped-def]

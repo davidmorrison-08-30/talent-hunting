@@ -106,10 +106,6 @@ class Settings(BaseSettings):
 
     # --- Runtime knobs ---------------------------------------------------
     run_migrations_on_startup: bool = True
-    enable_dispatcher: bool = Field(
-        default=True,
-        description="Run the in-process drip dispatcher for queued DM approvals.",
-    )
 
     @computed_field  # type: ignore[prop-decorator]
     @property

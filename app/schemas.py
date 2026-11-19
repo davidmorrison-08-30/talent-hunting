@@ -231,17 +231,6 @@ class DenyRequest(ApiModel):
     )
 
 
-class DispatchMode(ApiModel):
-    dispatch: str = Field(
-        default="blocking",
-        pattern="^(blocking|queued)$",
-        description=(
-            "'blocking' sends within the request (respecting the pacing delay); "
-            "'queued' hands off to the background drip dispatcher."
-        ),
-    )
-
-
 class SendResult(ApiModel):
     id: uuid.UUID
     x_user_id: str

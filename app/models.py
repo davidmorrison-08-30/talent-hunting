@@ -41,7 +41,6 @@ class OutreachStatus(enum.StrEnum):
 
     DRAFT = "DRAFT"
     PENDING_APPROVAL = "PENDING_APPROVAL"
-    APPROVED = "APPROVED"
     SENT = "SENT"
     DENIED = "DENIED"
     BLOCKED = "BLOCKED"
@@ -52,7 +51,6 @@ class OutreachStatus(enum.StrEnum):
 #: Statuses that block any further outreach to the same recipient.
 ACTIVE_OUTREACH_STATUSES = (
     OutreachStatus.PENDING_APPROVAL,
-    OutreachStatus.APPROVED,
     OutreachStatus.SENT,
     OutreachStatus.OPTED_OUT,
 )
@@ -190,9 +188,9 @@ class OutreachRecord(Base):
             "uq_outreach_active_x_user_id",
             "x_user_id",
             unique=True,
-            postgresql_where=(
-                "status IN ('PENDING_APPROVAL', 'APPROVED', 'SENT', 'OPTED_OUT')"
-            ),
+                postgresql_where=(
+                    "status IN ('PENDING_APPROVAL', 'SENT', 'OPTED_OUT')"
+                ),
         ),
         Index("ix_outreach_status_created", "status", "created_at"),
     )

@@ -8,6 +8,7 @@ for conversations the agent started.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -161,7 +162,14 @@ async def _get_or_create_conversation(
 async def conversation_history(
     session: AsyncSession, x_user_id: str
 ) -> list[dict[str, Any]]:
-    """The cached message history for one recipient, oldest first."""
+    """The cached message history for one recipient, oldest first.
+
+    Both directions are included. The rows the operator sent carry the
+    operator's own id as the sender, so ``outbound`` tells the two apart
+    without the caller needing to know who the operator is.
+    """
+    operator_id = await _operator_x_user_id(session)
+
     result = await session.execute(
         select(DmEvent)
         .where(
@@ -175,10 +183,78 @@ async def conversation_history(
             "id": event.id,
             "sender_id": event.sender_id,
             "text": event.text,
+            "event_type": event.event_type,
             "created_at": event.created_at,
+            "outbound": bool(operator_id) and event.sender_id == operator_id,
         }
         for event in result.scalars().all()
     ]
+
+
+async def cache_outbound_message(
+    session: AsyncSession,
+    *,
+    x_user_id: str,
+    text: str,
+    x_message_id: str | None = None,
+    sent_at: datetime | None = None,
+    conversation_id: str | None = None,
+) -> DmEvent:
+    """Cache a message the operator sent, so the history is complete.
+
+    The row mirrors an inbound event: the same table, the same
+    ``MessageCreate`` event type, so the history query does not need a second
+    code path for the outbound direction.
+    """
+    operator_id = await _operator_x_user_id(session)
+
+    if conversation_id is None:
+        conversation_id = await _conversation_id_for(session, x_user_id)
+
+    await _get_or_create_conversation(session, x_user_id, conversation_id)
+
+    event_id = x_message_id or f"outbound-{uuid.uuid4()}"
+    existing = await session.get(DmEvent, event_id)
+    if existing is not None:
+        return existing
+
+    event = DmEvent(
+        id=event_id,
+        conversation_id=conversation_id,
+        x_user_id=x_user_id,
+        sender_id=operator_id,
+        text=text,
+        event_type="MessageCreate",
+        created_at=sent_at or datetime.now(UTC),
+    )
+    session.add(event)
+    await session.flush()
+    log.info(
+        "outbound_message_cached",
+        x_user_id=x_user_id,
+        conversation_id=conversation_id,
+    )
+    return event
+
+
+async def _operator_x_user_id(session: AsyncSession) -> str | None:
+    """The id of the connected X account, if one is stored."""
+    from app.models import OAuthToken
+
+    result = await session.execute(select(OAuthToken).limit(1))
+    token = result.scalar_one_or_none()
+    return token.x_user_id if token is not None else None
+
+
+async def _conversation_id_for(
+    session: AsyncSession, x_user_id: str
+) -> str | None:
+    """The known conversation id for a recipient, if one was seen before."""
+    result = await session.execute(
+        select(DmConversation).where(DmConversation.x_user_id == x_user_id)
+    )
+    row = result.scalar_one_or_none()
+    return row.conversation_id if row is not None else None
 
 
 async def mark_conversation_read(session: AsyncSession, x_user_id: str) -> None:

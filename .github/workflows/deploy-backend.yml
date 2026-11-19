@@ -68,7 +68,6 @@ jobs:
           TR_SECRET_DM_POLL_INTERVAL_SECONDS: ${{ secrets.DM_POLL_INTERVAL_SECONDS }}
           TR_SECRET_DISCOVERY_SPEND_CEILING_USD: ${{ secrets.DISCOVERY_SPEND_CEILING_USD }}
           TR_SECRET_RUN_MIGRATIONS_ON_STARTUP: ${{ secrets.RUN_MIGRATIONS_ON_STARTUP }}
-          TR_SECRET_ENABLE_DISPATCHER: ${{ secrets.ENABLE_DISPATCHER }}
         run: |
           python3 - <<'PY'
           import json, os, subprocess, sys
@@ -82,7 +81,7 @@ jobs:
               "DM_DAILY_CAP", "DM_MIN_DELAY_SECONDS", "DM_MAX_DELAY_SECONDS",
               "DM_SIMILARITY_THRESHOLD", "DM_POLL_INTERVAL_SECONDS",
               "DISCOVERY_SPEND_CEILING_USD",
-              "RUN_MIGRATIONS_ON_STARTUP", "ENABLE_DISPATCHER",
+              "RUN_MIGRATIONS_ON_STARTUP",
           ]
           payload = {
               key: os.environ.get(f"TR_SECRET_{key}", "") for key in keys

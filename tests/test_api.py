@@ -20,6 +20,7 @@ import respx
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from app.api.auth_routes import router as auth_router
 from app.api.compliance import router as compliance_router
@@ -826,43 +827,108 @@ async def test_approve_unknown_draft_is_404(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_approve_with_queued_dispatch_marks_the_record_approved(
-    client: AsyncClient, db_session, auth_token, fake_llm, x_api_mock
+async def test_current_draft_returns_the_one_pending_draft(
+    client: AsyncClient, db_session
 ) -> None:
-    """The queued mode hands the record to the drip dispatcher."""
-    created = await client.post(
-        "/api/v1/outreach/drafts", json={"x_user_id": "u1"}
+    """The chat panel asks for the single draft an account is waiting on."""
+    record = OutreachRecord(
+        id=uuid.uuid4(),
+        x_user_id="u1",
+        status=OutreachStatus.PENDING_APPROVAL.value,
+        draft_versions=[{"version": 1, "text": "hello"}],
+        evidence_snapshot={},
+        feedback=[],
     )
-    record_id = created.json()["id"]
+    db_session.add(record)
+    await db_session.flush()
 
-    response = await client.post(
-        f"/api/v1/outreach/drafts/{record_id}/approve?dispatch=queued"
-    )
+    response = await client.get("/api/v1/outreach/drafts/current?x_user_id=u1")
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == OutreachStatus.APPROVED.value
-    # Nothing has been sent yet: the dispatcher sends it.
-    assert body["x_message_id"] is None
+    assert body["id"] == str(record.id)
+    assert body["draft_versions"][0]["text"] == "hello"
 
 
 @pytest.mark.asyncio
-async def test_resume_dispatch_endpoint_reports_the_queue(
-    client: AsyncClient, db_session, monkeypatch
+async def test_current_draft_is_404_when_there_is_none(
+    client: AsyncClient, db_session
 ) -> None:
-    """The resume endpoint restarts the dispatcher and drains the queue."""
-    from app.services import dispatcher as dispatcher_service
+    response = await client.get("/api/v1/outreach/drafts/current?x_user_id=u1")
+    assert response.status_code == 404
 
-    async def _fake_resume(settings=None):  # type: ignore[no-untyped-def]
-        return 3
 
-    monkeypatch.setattr(dispatcher_service, "resume", _fake_resume)
+@pytest.mark.asyncio
+async def test_current_draft_ignores_a_sent_record(
+    client: AsyncClient, db_session
+) -> None:
+    """A record that was already sent is not a pending draft any more."""
+    db_session.add(
+        OutreachRecord(
+            id=uuid.uuid4(),
+            x_user_id="u1",
+            status=OutreachStatus.SENT.value,
+            draft_versions=[{"version": 1, "text": "hello"}],
+            evidence_snapshot={},
+            feedback=[],
+        )
+    )
+    await db_session.flush()
 
-    response = await client.post("/api/v1/outreach/dispatch/resume")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["sent"] == 3
-    assert "dispatcher_running" in body
+    response = await client.get("/api/v1/outreach/drafts/current?x_user_id=u1")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_draft_discards_an_unapproved_record(
+    client: AsyncClient, db_session
+) -> None:
+    """Switching accounts deletes the draft that was still waiting."""
+    record = OutreachRecord(
+        id=uuid.uuid4(),
+        x_user_id="u1",
+        status=OutreachStatus.PENDING_APPROVAL.value,
+        draft_versions=[{"version": 1, "text": "hello"}],
+        evidence_snapshot={},
+        feedback=[],
+    )
+    db_session.add(record)
+    await db_session.flush()
+
+    response = await client.delete(f"/api/v1/outreach/drafts/{record.id}")
+    assert response.status_code == 204
+
+    remaining = (
+        await db_session.execute(select(OutreachRecord))
+    ).scalars().all()
+    assert record.id not in {r.id for r in remaining}
+
+
+@pytest.mark.asyncio
+async def test_delete_draft_refuses_to_remove_a_sent_record(
+    client: AsyncClient, db_session
+) -> None:
+    """A sent message is the audit trail and is never discarded."""
+    record = OutreachRecord(
+        id=uuid.uuid4(),
+        x_user_id="u1",
+        status=OutreachStatus.SENT.value,
+        draft_versions=[{"version": 1, "text": "hello"}],
+        evidence_snapshot={},
+        feedback=[],
+    )
+    db_session.add(record)
+    await db_session.flush()
+
+    response = await client.delete(f"/api/v1/outreach/drafts/{record.id}")
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_delete_unknown_draft_is_404(client: AsyncClient) -> None:
+    response = await client.delete(
+        "/api/v1/outreach/drafts/00000000-0000-0000-0000-000000000000"
+    )
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -906,7 +972,7 @@ async def test_deny_requires_feedback(client: AsyncClient, db_session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_draft_listing_and_queue(client: AsyncClient, db_session) -> None:
+async def test_draft_listing(client: AsyncClient, db_session) -> None:
     db_session.add(
         OutreachRecord(
             id=uuid.uuid4(),
@@ -929,8 +995,66 @@ async def test_draft_listing_and_queue(client: AsyncClient, db_session) -> None:
     response = await client.get("/api/v1/outreach/drafts?status=SENT")
     assert len(response.json()) == 0
 
+
+@pytest.mark.asyncio
+async def test_the_approval_queue_endpoint_is_gone(client: AsyncClient) -> None:
+    """The global approval queue no longer exists."""
     response = await client.get("/api/v1/outreach/queue")
-    assert len(response.json()) == 1
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_full_draft_lifecycle_without_a_queue(
+    client: AsyncClient, db_session, auth_token, fake_llm, x_api_mock
+) -> None:
+    """Draft, switch away, come back, approve, and read the conversation.
+
+    This is the whole operator flow the queue used to serve: one draft per
+    account, discarded when the operator moves on, and the sent message
+    showing up in the conversation afterwards.
+    """
+    # A draft is created and is the account's one pending draft.
+    created = await client.post(
+        "/api/v1/outreach/drafts", json={"x_user_id": "u1", "goal": "hello"}
+    )
+    assert created.status_code == 201
+    record_id = created.json()["id"]
+
+    current = await client.get("/api/v1/outreach/drafts/current?x_user_id=u1")
+    assert current.status_code == 200
+    assert current.json()["id"] == record_id
+
+    # The operator moves to another account, so the draft is discarded.
+    discarded = await client.delete(f"/api/v1/outreach/drafts/{record_id}")
+    assert discarded.status_code == 204
+
+    gone = await client.get("/api/v1/outreach/drafts/current?x_user_id=u1")
+    assert gone.status_code == 404
+
+    # Because the draft is gone, a new one can be drafted for the same account.
+    again = await client.post(
+        "/api/v1/outreach/drafts", json={"x_user_id": "u1", "goal": "hello again"}
+    )
+    assert again.status_code == 201
+    new_record_id = again.json()["id"]
+    assert new_record_id != record_id
+
+    # Approving sends it and clears the pending draft.
+    approved = await client.post(f"/api/v1/outreach/drafts/{new_record_id}/approve")
+    assert approved.status_code == 200
+    assert approved.json()["status"] == OutreachStatus.SENT.value
+
+    after = await client.get("/api/v1/outreach/drafts/current?x_user_id=u1")
+    assert after.status_code == 404
+
+    # The sent message is part of the conversation.
+    conversation = await client.get("/api/v1/outreach/conversations/u1")
+    assert conversation.status_code == 200
+    rows = conversation.json()
+    assert len(rows) == 1
+    assert rows[0]["outbound"] is True
+    assert "IK solver" in rows[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -960,6 +1084,44 @@ async def test_conversation_endpoint(client: AsyncClient, db_session) -> None:
     response = await client.get("/api/v1/outreach/conversations/u1")
     assert response.status_code == 200
     assert response.json()[0]["text"] == "hi there"
+    # The recipient wrote this one, so it is not an outbound message.
+    assert response.json()[0]["outbound"] is False
+
+
+@pytest.mark.asyncio
+async def test_conversation_endpoint_includes_outbound_messages(
+    client: AsyncClient, db_session, auth_token
+) -> None:
+    """A message the operator sent is part of the conversation."""
+    db_session.add(
+        DmEvent(
+            id="evt-1",
+            conversation_id="c1",
+            x_user_id="u1",
+            sender_id="u1",
+            text="hello there",
+            event_type="MessageCreate",
+        )
+    )
+    db_session.add(
+        DmEvent(
+            id="evt-2",
+            conversation_id="c1",
+            x_user_id="u1",
+            sender_id=auth_token.x_user_id,
+            text="hi, I am the operator",
+            event_type="MessageCreate",
+        )
+    )
+    await db_session.flush()
+
+    response = await client.get("/api/v1/outreach/conversations/u1")
+    assert response.status_code == 200
+    rows = response.json()
+    assert len(rows) == 2
+    assert rows[0]["outbound"] is False
+    assert rows[1]["outbound"] is True
+    assert rows[1]["text"] == "hi, I am the operator"
 
 
 # ---------------------------------------------------------------------------

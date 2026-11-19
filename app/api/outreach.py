@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 
 import structlog
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +16,6 @@ from app.errors import ConflictError, NotFoundError, ValidationError
 from app.models import OutreachRecord, OutreachStatus
 from app.schemas import (
     DenyRequest,
-    DispatchMode,
     DraftRequest,
     DraftResponse,
     DraftVersion,
@@ -30,6 +29,14 @@ from app.x.errors import x_error_fields
 router = APIRouter(prefix="/api/v1/outreach", tags=["outreach"])
 
 log = structlog.get_logger(__name__)
+
+#: The statuses of a record that is still waiting for a human decision. Such a
+#: record is the one draft an account has, and it is the only kind that can be
+#: discarded without touching the audit trail of what was actually sent.
+_UNAPPROVED_STATUSES = (
+    OutreachStatus.DRAFT.value,
+    OutreachStatus.PENDING_APPROVAL.value,
+)
 
 
 def _to_response(record: OutreachRecord) -> DraftResponse:
@@ -123,6 +130,39 @@ async def list_drafts(
 
 
 @router.get(
+    "/drafts/current",
+    response_model=DraftResponse,
+    summary="The one draft currently waiting for a decision on an account",
+)
+async def current_draft(
+    x_user_id: str = Query(
+        ..., description="The recipient whose pending draft should be returned."
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> DraftResponse:
+    """Return the single unapproved draft for a recipient.
+
+    There is no global approval queue any more: each account has at most one
+    draft waiting for a decision, and the chat panel asks for it when an
+    account is selected. The newest unapproved record wins, so a revision made
+    with reviewer feedback is the one that is shown.
+    """
+    result = await session.execute(
+        select(OutreachRecord)
+        .where(
+            OutreachRecord.x_user_id == x_user_id,
+            OutreachRecord.status.in_(_UNAPPROVED_STATUSES),
+        )
+        .order_by(OutreachRecord.created_at.desc())
+        .limit(1)
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        raise NotFoundError(f"No pending draft for {x_user_id}")
+    return _to_response(record)
+
+
+@router.get(
     "/drafts/{record_id}",
     response_model=DraftResponse,
     summary="Get one outreach record with its evidence",
@@ -144,33 +184,18 @@ async def get_draft(
 )
 async def approve_draft(
     record_id: uuid.UUID,
-    mode: DispatchMode = Depends(),
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
 ) -> SendResult:
     """Approve and send a drafted message.
 
-    ``dispatch=blocking`` sends within the request, honouring the randomized
-    30-90 second pacing delay. ``dispatch=queued`` hands the record to the
-    background drip dispatcher, which sends it sequentially with the same
-    pacing. Either way the dedup lock, the suppression list and the daily cap
+    The message goes out within the request, honouring the randomized 30-90
+    second pacing delay. The dedup lock, the suppression list and the daily cap
     are re-checked immediately before the message goes out.
     """
     record = await session.get(OutreachRecord, record_id)
     if record is None:
         raise NotFoundError(f"No outreach record with id {record_id}")
-
-    if mode.dispatch == "queued":
-        record.status = OutreachStatus.APPROVED.value
-        await session.flush()
-        from app.services.dispatcher import enqueue
-
-        await enqueue(session, record.id)
-        return SendResult(
-            id=record.id,
-            x_user_id=record.x_user_id,
-            status=record.status,
-        )
 
     async with XClient(session) as client:
         outcome = await draft_agent.approve_and_send(
@@ -269,40 +294,37 @@ async def poll_events(
     )
 
 
-@router.get("/queue", response_model=list[DraftResponse], summary="The approval queue")
-async def approval_queue(
-    session: AsyncSession = Depends(get_session),
-) -> list[DraftResponse]:
-    """Every draft awaiting a human decision."""
-    result = await session.execute(
-        select(OutreachRecord)
-        .where(OutreachRecord.status == OutreachStatus.PENDING_APPROVAL.value)
-        .order_by(OutreachRecord.created_at.asc())
-    )
-    return [_to_response(record) for record in result.scalars().all()]
-
-
-@router.post(
-    "/dispatch/resume",
-    summary="Restart the drip dispatcher and drain anything left queued",
+@router.delete(
+    "/drafts/{record_id}",
+    status_code=204,
+    summary="Discard an unapproved draft",
 )
-async def resume_dispatch(
-    settings: Settings = Depends(get_settings),
-) -> dict[str, object]:
-    """Restart the background drip dispatcher after a crash or restart.
+async def delete_draft(
+    record_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Delete a draft that has not been approved yet.
 
-    The queue lives in Postgres (records in the ``APPROVED`` state), so nothing
-    is lost when the process dies. Calling this endpoint restarts the
-    dispatcher and sends everything still queued, sequentially and with the
-    same pacing delay as a blocking approval.
+    Switching to another account discards the draft that was still waiting for
+    a decision, so the record is deleted rather than left behind as an
+    invisible pending draft that would block the next one for the same
+    recipient. A record that was already sent (or otherwise reached a terminal
+    state) is never deleted: it is the audit trail of what went out.
     """
-    from app.services.dispatcher import dispatcher, resume
+    record = await session.get(OutreachRecord, record_id)
+    if record is None:
+        raise NotFoundError(f"No outreach record with id {record_id}")
 
-    sent = await resume(settings)
-    return {
-        "dispatcher_running": dispatcher.running,
-        "sent": sent,
-    }
+    if record.status not in _UNAPPROVED_STATUSES:
+        raise ConflictError(
+            "This message was already approved or sent and cannot be discarded",
+            details={"record_id": str(record.id), "status": record.status},
+        )
+
+    await session.delete(record)
+    await session.flush()
+    log.info("draft_discarded", record_id=str(record.id), x_user_id=record.x_user_id)
+    return Response(status_code=204)
 
 
 @router.get("/budget", summary="Today's dispatch and read budget")
@@ -338,21 +360,13 @@ async def conversation(
     x_user_id: str,
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, object]]:
-    """Return the locally cached DM history for a recipient."""
-    from app.models import DmEvent
+    """Return the locally cached DM history for a recipient.
 
-    result = await session.execute(
-        select(DmEvent)
-        .where(DmEvent.x_user_id == x_user_id)
-        .order_by(DmEvent.created_at.asc())
-    )
-    return [
-        {
-            "id": event.id,
-            "sender_id": event.sender_id,
-            "text": event.text,
-            "event_type": event.event_type,
-            "created_at": event.created_at,
-        }
-        for event in result.scalars().all()
-    ]
+    Both directions are included: the messages the operator sent are cached
+    when they are approved, and the inbound messages are cached by the DM
+    event poll. Each row carries ``outbound`` so the caller can tell the two
+    apart without knowing the operator's own id.
+    """
+    from app.services import conversations as conversation_service
+
+    return await conversation_service.conversation_history(session, x_user_id)

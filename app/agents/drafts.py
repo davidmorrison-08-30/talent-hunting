@@ -49,6 +49,7 @@ from app.models import (
     OutreachStatus,
 )
 from app.services import dedup, pacing
+from app.services.conversations import cache_outbound_message
 from app.x.client import XClient
 from app.x.errors import BlockedDMError, XApiError
 
@@ -437,10 +438,7 @@ async def approve_and_send(
             error="This message was already sent",
         )
 
-    if record.status not in (
-        OutreachStatus.PENDING_APPROVAL.value,
-        OutreachStatus.APPROVED.value,
-    ):
+    if record.status not in (OutreachStatus.PENDING_APPROVAL.value,):
         return SendOutcome(
             record_id=record.id,
             x_user_id=record.x_user_id,
@@ -564,6 +562,16 @@ async def approve_and_send(
     record.error = None
     await session.flush()
 
+    # The sent message is cached like an inbound one, so the conversation the
+    # operator sees is the whole exchange and not only what the recipient
+    # replied.
+    await _cache_outbound_message(
+        session,
+        x_user_id=record.x_user_id,
+        text=text,
+        x_message_id=record.x_message_id,
+        sent_at=record.sent_at,
+    )
     await pacing.record_dm_sent(session)
     log.info(
         "dm_sent",
@@ -578,6 +586,31 @@ async def approve_and_send(
         x_message_id=record.x_message_id,
         delay_applied_seconds=delay,
     )
+
+
+async def _cache_outbound_message(
+    session: AsyncSession,
+    *,
+    x_user_id: str,
+    text: str,
+    x_message_id: str | None,
+    sent_at: datetime | None,
+) -> None:
+    """Cache the message the operator just sent, so the history is complete.
+
+    A failure here must not turn a successful send into a failure, so the
+    error is logged and swallowed: the message is already out.
+    """
+    try:
+        await cache_outbound_message(
+            session,
+            x_user_id=x_user_id,
+            text=text,
+            x_message_id=x_message_id,
+            sent_at=sent_at,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("outbound_message_cache_failed", x_user_id=x_user_id, error=str(exc))
 
 
 async def find_near_duplicate(

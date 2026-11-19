@@ -61,7 +61,6 @@ async def suppress(
                 (
                     OutreachStatus.DRAFT.value,
                     OutreachStatus.PENDING_APPROVAL.value,
-                    OutreachStatus.APPROVED.value,
                 )
             ),
         )
