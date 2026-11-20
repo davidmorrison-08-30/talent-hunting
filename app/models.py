@@ -95,6 +95,7 @@ class DiscoveryRun(Base):
     input_type: Mapped[str] = mapped_column(String(32), nullable=False)
     target_segment: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     seed_accounts: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    known_human_accounts: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="PENDING", nullable=False)
     stats: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

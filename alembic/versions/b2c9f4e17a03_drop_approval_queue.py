@@ -11,6 +11,12 @@ from that:
   ``PENDING_APPROVAL`` where it shows up as the one pending draft for that
   recipient.
 
+The migration does not take a lock of its own: the application already holds
+the migration advisory lock while it applies the revisions, so the revision
+must not ask for the same lock again or it would wait for itself. The DDL is
+written to be re-runnable instead, so a half-applied migration cannot stop
+the service from starting.
+
 Revision ID: b2c9f4e17a03
 Revises: 771d0697afa5
 """
@@ -43,11 +49,12 @@ def upgrade() -> None:
     )
 
     # The dedup lock is rewritten with the new predicate.
-    op.drop_index(
-        "uq_outreach_active_x_user_id",
-        table_name="outreach_records",
-        postgresql_where=_OLD_PREDICATE,
-    )
+    #
+    # The index is dropped without its predicate: Alembic ignores
+    # ``postgresql_where`` on a drop, and PostgreSQL's DROP INDEX takes no
+    # WHERE clause. The drop is guarded so a migration that was applied
+    # before cannot stop the service from starting.
+    op.execute(sa.text("DROP INDEX IF EXISTS uq_outreach_active_x_user_id"))
     op.create_index(
         "uq_outreach_active_x_user_id",
         "outreach_records",
@@ -58,11 +65,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "uq_outreach_active_x_user_id",
-        table_name="outreach_records",
-        postgresql_where=_NEW_PREDICATE,
-    )
+    op.execute(sa.text("DROP INDEX IF EXISTS uq_outreach_active_x_user_id"))
     op.create_index(
         "uq_outreach_active_x_user_id",
         "outreach_records",

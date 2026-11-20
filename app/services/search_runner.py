@@ -61,6 +61,7 @@ async def start_run(
         input_type=_input_type(target_segment, seed_accounts),
         target_segment=list(target_segment or []),
         seed_accounts=list(seed_accounts or []),
+        known_human_accounts=list(known_human_accounts or []),
         status=RUNNING,
         stats={},
     )
@@ -169,6 +170,9 @@ async def resume_pending(settings: Settings | None = None) -> int:
                 settings=settings,
                 include_bots=False,
                 bot_score_threshold=0.6,
+                # The accounts the operator vouched for are remembered on the
+                # run row, so a resumed run keeps them.
+                known_human_accounts=list(run.known_human_accounts or []),
             )
         )
     if pending:

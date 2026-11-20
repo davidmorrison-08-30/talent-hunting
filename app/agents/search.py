@@ -228,6 +228,7 @@ async def run_discovery(
             input_type=_input_type(target_segment, seed_accounts),
             target_segment=list(target_segment or []),
             seed_accounts=list(seed_accounts or []),
+            known_human_accounts=list(known_human_accounts or []),
             status="RUNNING",
         )
         session.add(run)
@@ -241,6 +242,7 @@ async def run_discovery(
                 input_type=_input_type(target_segment, seed_accounts),
                 target_segment=list(target_segment or []),
                 seed_accounts=list(seed_accounts or []),
+                known_human_accounts=list(known_human_accounts or []),
                 status="RUNNING",
             )
             session.add(run)

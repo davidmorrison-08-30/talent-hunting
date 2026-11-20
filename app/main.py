@@ -20,6 +20,36 @@ from app.config import get_settings
 from app.db import dispose_engine
 from app.errors import AppError
 from app.migrations import run_migrations, wait_for_database
+from app.startup_diag import record, record_failure
+
+# region agent log
+#: The debug session's log file. Startup diagnostics are appended as NDJSON.
+_DEBUG_LOG_PATH = "/home/david/Desktop/talent-hunting/.cursor/debug-8a49d1.log"
+_DEBUG_SESSION_ID = "8a49d1"
+
+
+def _debug_log(hypothesis_id: str, message: str, **data: object) -> None:
+    """Append one NDJSON record to the debug session's log file."""
+    import json
+    import time
+
+    payload = {
+        "sessionId": _DEBUG_SESSION_ID,
+        "runId": "startup-diagnosis",
+        "hypothesisId": hypothesis_id,
+        "location": "app/main.py",
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, default=str) + "\n")
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        pass
+
+
+# endregion agent log
 
 settings = get_settings()
 
@@ -40,17 +70,46 @@ log = structlog.get_logger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("startup", app=settings.app_name, configured=settings.is_configured)
 
+    # region agent log
+    record("lifespan_enter", configured=settings.is_configured)
+    _debug_log(
+        "H1-H2",
+        "lifespan entered",
+        configured=settings.is_configured,
+        run_migrations_on_startup=settings.run_migrations_on_startup,
+        database_host=_database_host(),
+    )
+    # endregion agent log
+
     if settings.run_migrations_on_startup:
         log.info("migrations_start")
+        # region agent log
+        record("migrations_start")
+        # endregion agent log
         try:
             # The API and Postgres containers start together on ECS, so the
             # database may not be listening yet.
             await wait_for_database()
+            # region agent log
+            record("database_reachable")
+            # endregion agent log
             await run_migrations()
+            # region agent log
+            record("migrations_applied")
+            # endregion agent log
         except Exception as exc:  # noqa: BLE001
             # A failed migration must stop the service from serving traffic
             # against a half-migrated schema.
             log.error("migrations_failed", error=str(exc))
+            # region agent log
+            record_failure("migrations", exc)
+            _debug_log(
+                "H1",
+                "migration failed",
+                error_type=type(exc).__name__,
+                error=str(exc)[:2000],
+            )
+            # endregion agent log
             raise
         log.info("migrations_complete")
 
@@ -59,13 +118,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # still in flight when the task stopped is picked up again here.
         from app.services.search_runner import resume_pending
 
+        # region agent log
+        record("resume_pending_start")
+        # endregion agent log
         await resume_pending(settings)
+        # region agent log
+        record("resume_pending_ok")
+        # endregion agent log
         log.info("discovery_resume_checked")
 
         yield
     finally:
         await dispose_engine()
         log.info("shutdown")
+
+
+def _database_host() -> str:
+    """The host and database the app is configured to talk to."""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(settings.database_url)
+        return f"{parsed.hostname}:{parsed.port}/{parsed.path.lstrip('/')}"
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        return "unknown"
 
 
 app = FastAPI(
