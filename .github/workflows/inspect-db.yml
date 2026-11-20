@@ -1,0 +1,68 @@
+name: Inspect the live database
+
+on:
+  workflow_dispatch:
+    inputs:
+      sql:
+        description: "SQL to run against the live database inside the task"
+        required: true
+        default: "SELECT version_num FROM alembic_version"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect the live database
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::752919052098:role/github-deploy
+          aws-region: us-east-1
+
+      - name: Query the live database
+        env:
+          DIAG_SQL: ${{ inputs.sql }}
+        run: |
+          set -euo pipefail
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster talent-hunting-cluster \
+            --task-definition talent-hunting-backend:32 \
+            --enable-execute-command \
+            --count 1 \
+            --launch-type FARGATE \
+            --network-configuration 'awsvpcConfiguration={subnets=[subnet-0f0f7f2f45df933b6,subnet-0c23f04c9fdb28c18],securityGroups=[sg-02cf74e20ae259314],assignPublicIp=ENABLED}' \
+            --query 'tasks[0].taskArn' --output text)
+          echo "TASK_ARN=$TASK_ARN"
+
+          # The backend container fails during startup, so the exec agent may
+          # need a moment to come up. The postgres container stays up.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            echo "--- attempt $attempt ---"
+            if aws ecs execute-command \
+              --cluster talent-hunting-cluster \
+              --task "$TASK_ARN" \
+              --container postgres \
+              --interactive \
+              --command "psql -U postgres -d talent_hunting -c \"$DIAG_SQL\"" \
+              > /tmp/exec-out.txt 2>/tmp/exec-err.txt; then
+              echo "=== RESULT ==="
+              cat /tmp/exec-out.txt
+              break
+            fi
+            cat /tmp/exec-err.txt | head -3
+            sleep 10
+          done
+
+          aws ecs stop-task --cluster talent-hunting-cluster --task "$TASK_ARN" --reason "diagnostic" >/dev/null 2>&1 || true
+          echo "=== END ==="
