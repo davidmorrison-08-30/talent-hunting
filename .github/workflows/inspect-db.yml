@@ -35,32 +35,36 @@ jobs:
         run: |
           set -uo pipefail
 
-          TASK_ARN=$(aws ecs list-tasks \
-            --cluster talent-hunting-cluster \
-            --service-name talent-hunting-backend-svc \
-            --desired-status RUNNING \
-            --query 'taskArns[0]' --output text)
-          echo "TASK_ARN=$TASK_ARN"
+          # The service crash-loops, so there may be no RUNNING task at the
+          # moment this starts. Any task that is still up works, and the
+          # postgres container outlives the backend one.
+          for round in 1 2 3 4 5 6 7 8 9 10; do
+            for STATUS in RUNNING STOPPED; do
+              TASK_ARN=$(aws ecs list-tasks \
+                --cluster talent-hunting-cluster \
+                --service-name talent-hunting-backend-svc \
+                --desired-status "$STATUS" \
+                --query 'taskArns[0]' --output text 2>/dev/null)
+              [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ] && continue
 
-          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
-            echo "NO RUNNING TASK"
-            exit 1
-          fi
-
-          for attempt in 1 2 3 4 5 6 7 8; do
-            echo "--- attempt $attempt ---"
-            if aws ecs execute-command \
-              --cluster talent-hunting-cluster \
-              --task "$TASK_ARN" \
-              --container postgres \
-              --interactive \
-              --command "psql -U postgres -d talent_hunting -c \"$DIAG_SQL\"" \
-              > /tmp/exec-out.txt 2>/tmp/exec-err.txt; then
-              echo "=== RESULT ==="
-              cat /tmp/exec-out.txt
-              break
-            fi
-            head -3 /tmp/exec-err.txt
-            sleep 8
+              echo "--- round $round status $STATUS task $TASK_ARN ---"
+              for container in postgres backend; do
+                if aws ecs execute-command \
+                  --cluster talent-hunting-cluster \
+                  --task "$TASK_ARN" \
+                  --container "$container" \
+                  --interactive \
+                  --command "sh -c 'psql -U postgres -d talent_hunting -c \"\$0\"' \"$DIAG_SQL\"" \
+                  > /tmp/exec-out.txt 2>/tmp/exec-err.txt; then
+                  echo "=== RESULT ($container) ==="
+                  cat /tmp/exec-out.txt
+                  echo "=== END ==="
+                  exit 0
+                fi
+              done
+              head -2 /tmp/exec-err.txt
+            done
+            sleep 6
           done
-          echo "=== END ==="
+          echo "NO EXEC TARGET AVAILABLE"
+          exit 1
