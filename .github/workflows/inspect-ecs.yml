@@ -1,0 +1,37 @@
+name: Inspect ECS backend service
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Diagnostic shell command to run with AWS credentials"
+        required: true
+        default: "aws ecs describe-services --cluster talent-hunting-cluster --services talent-hunting-backend-svc"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect ECS backend service
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::752919052098:role/github-deploy
+          aws-region: us-east-1
+
+      - name: Run diagnostic
+        env:
+          DIAG_COMMAND: ${{ inputs.command }}
+        run: |
+          echo "### COMMAND: $DIAG_COMMAND"
+          eval "$DIAG_COMMAND" 2>&1 || echo "(command exited non-zero)"
